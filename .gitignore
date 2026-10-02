@@ -1,0 +1,10 @@
+node_modules/
+apps/server/.env
+apps/server/prisma/*.db
+apps/server/prisma/*.db-shm
+apps/server/prisma/*.db-wal
+apps/web/dist/
+apps/server/dist/
+backups/
+playwright-report/
+test-results/

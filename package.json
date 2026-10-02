@@ -1,0 +1,31 @@
+{
+  "name": "chemarena",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LAN-first organic chemistry competition preparation platform",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm --workspace @chemarena/server run dev",
+    "dev:web": "npm --workspace @chemarena/web run dev",
+    "build": "npm run build --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "db:generate": "npm --workspace @chemarena/server run db:generate",
+    "db:push": "npm --workspace @chemarena/server run db:push",
+    "db:seed": "npm --workspace @chemarena/server run db:seed"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.3"
+  },
+  "allowScripts": {
+    "@prisma/client@6.19.3": true,
+    "argon2@0.44.0": true,
+    "prisma@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "esbuild@0.28.2": true
+  }
+}
