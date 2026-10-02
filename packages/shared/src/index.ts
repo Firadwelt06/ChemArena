@@ -3,6 +3,10 @@ import { z } from "zod";
 export const RoleSchema = z.enum(["ADMIN", "STUDENT"]);
 export type Role = z.infer<typeof RoleSchema>;
 
+export function hasRole(actualRole: Role | undefined, requiredRole: Role): boolean {
+  return actualRole === requiredRole;
+}
+
 export const LoginSchema = z.object({
   username: z.string().trim().min(1).max(64),
   password: z.string().min(1).max(256)
@@ -30,6 +34,12 @@ export const BrandingSchema = z.object({
   logoDataUrl: z.string().max(1_000_000).nullable()
 });
 export type Branding = z.infer<typeof BrandingSchema>;
+
+export const TopicInputSchema = z.object({
+  title: z.string().trim().min(1).max(180),
+  description: z.string().max(2_000).default(""),
+  parentId: z.string().min(1).nullable().default(null)
+});
 
 export const QuestionOptionSchema = z.object({
   id: z.string().min(1).max(40),
@@ -71,7 +81,15 @@ export const AnswerSubmissionSchema = z.object({
   selectedOptionIds: z.array(z.string().min(1)).max(8),
   idempotencyKey: z.string().uuid(),
   changedAt: z.number().int().nonnegative()
+}).superRefine(({ selectedOptionIds }, context) => {
+  if (new Set(selectedOptionIds).size !== selectedOptionIds.length) {
+    context.addIssue({ code: "custom", message: "Selected options must be unique.", path: ["selectedOptionIds"] });
+  }
 });
+
+export function isSameIdempotentPayload(existingHash: string, requestHash: string): boolean {
+  return existingHash === requestHash;
+}
 
 export const ExamInputSchema = z.object({
   title: z.string().trim().min(1).max(160),

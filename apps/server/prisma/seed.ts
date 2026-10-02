@@ -4,7 +4,11 @@ import { PrismaClient, Role } from "@prisma/client";
 
 const prisma = new PrismaClient();
 
-const syllabus = [
+const syllabus: Array<{
+  title: string;
+  outcomes: string[];
+  questions: Array<[string, string[], number, string]>;
+}> = [
   {
     title: "Introduction to Hydrocarbons and Crude Oil",
     outcomes: [

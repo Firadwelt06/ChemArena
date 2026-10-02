@@ -8,18 +8,27 @@ import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import argon2 from "argon2";
 import { PrismaClient, Role, RecordStatus } from "@prisma/client";
-import { AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, LoginSchema, QuestionSchema, scoreAnswer, StudentImportSchema } from "@chemarena/shared";
+import { AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, hasRole, isSameIdempotentPayload, LoginSchema, QuestionSchema, scoreAnswer, StudentImportSchema, TopicInputSchema } from "@chemarena/shared";
 
 const prisma = new PrismaClient();
 const app = Fastify({ logger: true, trustProxy: false, bodyLimit: 2_000_000 });
-const port = Number(process.env.PORT ?? 4174);
+function integerSetting(name: string, fallback: number, min: number, max: number): number {
+  const value = process.env[name];
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} must be a whole number from ${min} to ${max}.`);
+  }
+  return parsed;
+}
+
+const port = integerSetting("PORT", 4174, 1, 65_535);
 const host = process.env.HOST ?? "0.0.0.0";
 const sessionDurationMs = 12 * 60 * 60 * 1_000;
 const sessionCookie = "chemarena_session";
-const submissionGraceSeconds = Number(process.env.SUBMISSION_GRACE_SECONDS ?? 60);
+const submissionGraceSeconds = integerSetting("SUBMISSION_GRACE_SECONDS", 60, 0, 300);
 
 type AuthenticatedRequest = FastifyRequest & {
-  auth?: { userId: string; role: Role; csrfToken: string; sessionId: string };
+  auth?: { userId: string; role: Role; csrfToken: string; sessionId: string; mustChangePassword: boolean };
 };
 
 function publicUser(user: { id: string; username: string; displayName: string; role: Role; mustChangePassword: boolean }) {
@@ -64,23 +73,37 @@ async function authenticate(request: AuthenticatedRequest, reply: FastifyReply):
     userId: session.userId,
     role: session.user.role,
     csrfToken: session.csrfToken,
-    sessionId: session.id
+    sessionId: session.id,
+    mustChangePassword: session.user.mustChangePassword
   };
+  if (Date.now() - session.lastSeenAt.getTime() >= 10_000) {
+    await prisma.session.update({ where: { id: session.id }, data: { lastSeenAt: new Date() } });
+  }
 }
 
 async function requireAdmin(request: AuthenticatedRequest, reply: FastifyReply): Promise<void> {
   await authenticate(request, reply);
   if (reply.sent) return;
-  if (request.auth?.role !== Role.ADMIN) {
+  const auth = request.auth;
+  if (!auth || !hasRole(auth.role, Role.ADMIN)) {
     reply.code(403).send({ error: "Administrator permission required." });
+    return;
+  }
+  if (auth.mustChangePassword) {
+    reply.code(403).send({ error: "Change your temporary password before continuing." });
   }
 }
 
 async function requireStudent(request: AuthenticatedRequest, reply: FastifyReply): Promise<void> {
   await authenticate(request, reply);
   if (reply.sent) return;
-  if (request.auth?.role !== Role.STUDENT) {
+  const auth = request.auth;
+  if (!auth || !hasRole(auth.role, Role.STUDENT)) {
     reply.code(403).send({ error: "Student permission required." });
+    return;
+  }
+  if (auth.mustChangePassword) {
+    reply.code(403).send({ error: "Change your temporary password before continuing." });
   }
 }
 
@@ -169,9 +192,22 @@ app.post("/api/auth/logout", { preHandler: requireCsrf }, async (request: Authen
   return { ok: true };
 });
 
-app.get("/api/auth/me", { preHandler: authenticate }, async (request: AuthenticatedRequest) => {
-  const user = await prisma.user.findUniqueOrThrow({ where: { id: request.auth!.userId } });
-  return { user: publicUser(user) };
+app.post("/api/auth/heartbeat", { preHandler: [requireCsrf] }, async (request: AuthenticatedRequest) => {
+  const lastSeenAt = new Date();
+  await prisma.session.update({ where: { id: request.auth!.sessionId }, data: { lastSeenAt } });
+  return { ok: true, lastSeenAt };
+});
+
+app.get("/api/auth/me", async (request, reply) => {
+  const sessionId = readCookie(request);
+  if (!sessionId) return { user: null };
+  const session = await prisma.session.findUnique({ where: { id: sessionId }, include: { user: true } });
+  if (!session || session.expiresAt <= new Date() || session.user.status !== RecordStatus.ACTIVE) {
+    if (session) await prisma.session.delete({ where: { id: session.id } });
+    reply.clearCookie(sessionCookie, { path: "/" });
+    return { user: null };
+  }
+  return { user: publicUser(session.user) };
 });
 
 app.post("/api/auth/change-password", { preHandler: requireCsrf }, async (request: AuthenticatedRequest, reply) => {
@@ -225,7 +261,7 @@ app.get("/api/admin/classes", { preHandler: requireAdmin }, async () =>
   prisma.class.findMany({ orderBy: { name: "asc" }, include: { _count: { select: { enrollments: true } } } })
 );
 
-app.post("/api/admin/classes", { preHandler: [requireCsrf, requireAdmin] }, async (request, reply) => {
+app.post("/api/admin/classes", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const body = request.body as { name?: unknown };
   const name = typeof body.name === "string" ? body.name.trim() : "";
   if (!name || name.length > 80) return reply.code(400).send({ error: "Class name must be between 1 and 80 characters." });
@@ -264,7 +300,7 @@ app.get("/api/admin/students", { preHandler: requireAdmin }, async () =>
   })
 );
 
-app.post("/api/admin/students", { preHandler: [requireCsrf, requireAdmin] }, async (request, reply) => {
+app.post("/api/admin/students", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const body = request.body as { username?: unknown; displayName?: unknown; classId?: unknown };
   const username = typeof body.username === "string" ? body.username.trim().toLowerCase() : "";
   const displayName = typeof body.displayName === "string" ? body.displayName.trim() : "";
@@ -353,6 +389,53 @@ app.post("/api/admin/students/:id/reset-password", { preHandler: [requireCsrf, r
 });
 
 app.get("/api/topics", { preHandler: authenticate }, async () => prisma.topic.findMany({ orderBy: [{ sourceOrder: "asc" }, { title: "asc" }] }));
+
+app.post("/api/admin/topics", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const parsed = TopicInputSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid topic." });
+  if (parsed.data.parentId) {
+    const parent = await prisma.topic.findUnique({ where: { id: parsed.data.parentId } });
+    if (!parent || parent.parentId) return reply.code(400).send({ error: "Choose a chapter as the parent topic." });
+  }
+  const sourceOrder = parsed.data.parentId
+    ? (await prisma.topic.aggregate({ where: { parentId: parsed.data.parentId }, _max: { sourceOrder: true } }))._max.sourceOrder ?? 0
+    : (await prisma.topic.aggregate({ where: { parentId: null }, _max: { sourceOrder: true } }))._max.sourceOrder ?? 0;
+  const topic = await prisma.topic.create({ data: { ...parsed.data, sourceOrder: sourceOrder + 1 } });
+  await audit(request.auth!.userId, "topic.created", "Topic", topic.id, { title: topic.title, parentId: topic.parentId });
+  return reply.code(201).send(topic);
+});
+
+app.put("/api/admin/topics/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = TopicInputSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid topic." });
+  const existing = await prisma.topic.findUnique({ where: { id } });
+  if (!existing) return reply.code(404).send({ error: "Topic not found." });
+  if (parsed.data.parentId === id || (parsed.data.parentId && !(await prisma.topic.findFirst({ where: { id: parsed.data.parentId, parentId: null } })))) {
+    return reply.code(400).send({ error: "Choose a different chapter as the parent topic." });
+  }
+  if (existing.parentId === null && parsed.data.parentId) {
+    return reply.code(400).send({ error: "A chapter cannot be moved beneath another topic." });
+  }
+  const topic = await prisma.topic.update({ where: { id }, data: parsed.data });
+  await audit(request.auth!.userId, "topic.updated", "Topic", id, { title: topic.title, parentId: topic.parentId });
+  return topic;
+});
+
+app.delete("/api/admin/topics/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const topic = await prisma.topic.findUnique({ where: { id } });
+  if (!topic) return reply.code(404).send({ error: "Topic not found." });
+  const [children, questions, lessons] = await Promise.all([
+    prisma.topic.count({ where: { parentId: id } }),
+    prisma.question.count({ where: { topicId: id } }),
+    prisma.lesson.count({ where: { topicId: id } })
+  ]);
+  if (children || questions || lessons) return reply.code(409).send({ error: "This topic has child topics or tagged content; move or remove them before deleting." });
+  await prisma.topic.delete({ where: { id } });
+  await audit(request.auth!.userId, "topic.deleted", "Topic", id, { title: topic.title });
+  return reply.code(204).send();
+});
 
 app.get("/api/admin/coverage", { preHandler: requireAdmin }, async () => {
   const topics = await prisma.topic.findMany({ orderBy: [{ sourceOrder: "asc" }, { title: "asc" }] });
@@ -525,28 +608,57 @@ app.patch("/api/admin/exams/:id/status", { preHandler: [requireCsrf, requireAdmi
 
 app.get("/api/admin/exams/:id/monitor", { preHandler: requireAdmin }, async (request, reply) => {
   const { id } = request.params as { id: string };
-  const exam = await prisma.exam.findUnique({ where: { id } });
-  if (!exam) return reply.code(404).send({ error: "Exam not found." });
-  const attempts = await prisma.examAttempt.findMany({
-    where: { examId: id },
+  const exam = await prisma.exam.findUnique({
+    where: { id },
     include: {
-      user: { select: { id: true, username: true, displayName: true } },
-      _count: { select: { answers: true } }
-    },
-    orderBy: { startedAt: "asc" }
+      classes: { select: { classId: true } },
+      students: { select: { userId: true } }
+    }
   });
+  if (!exam) return reply.code(404).send({ error: "Exam not found." });
+  const assignedUsers = new Map<string, { id: string; username: string; displayName: string }>();
+  const classIds = exam.classes.map(({ classId }) => classId);
+  const individualUserIds = exam.students.map(({ userId }) => userId);
+  const assignedRows = await prisma.user.findMany({
+    where: {
+      role: Role.STUDENT,
+      status: RecordStatus.ACTIVE,
+      OR: [
+        { enrollments: { some: { classId: { in: classIds } } } },
+        { id: { in: individualUserIds } }
+      ]
+    },
+    select: { id: true, username: true, displayName: true }
+  });
+  assignedRows.forEach((user) => assignedUsers.set(user.id, user));
+  const userIds = [...assignedUsers.keys()];
   const now = Date.now();
-  return attempts.map((attempt) => ({
-    id: attempt.id,
-    user: attempt.user,
-    status: attempt.status,
-    startedAt: attempt.startedAt,
-    deadline: attempt.deadline,
-    submittedAt: attempt.submittedAt,
-    answeredCount: attempt._count.answers,
-    questionCount: JSON.parse(attempt.questionOrder).length as number,
-    online: attempt.status === "IN_PROGRESS" && now - attempt.lastSeenAt.getTime() < 45_000
-  }));
+  const [attempts, sessions] = await Promise.all([
+    prisma.examAttempt.findMany({
+      where: { examId: id },
+      include: { _count: { select: { answers: true } } },
+      orderBy: { startedAt: "asc" }
+    }),
+    prisma.session.findMany({ where: { userId: { in: userIds }, expiresAt: { gt: new Date() } }, select: { userId: true, lastSeenAt: true } })
+  ]);
+  const attemptByUser = new Map(attempts.map((attempt) => [attempt.userId, attempt]));
+  const recentSessions = new Set(sessions.filter((session) => now - session.lastSeenAt.getTime() < 45_000).map(({ userId }) => userId));
+  return [...assignedUsers.values()].map((user) => {
+    const attempt = attemptByUser.get(user.id);
+    const active = attempt?.status === "IN_PROGRESS";
+    return {
+      id: attempt?.id ?? null,
+      user,
+      status: attempt?.status ?? "NOT_STARTED",
+      joined: recentSessions.has(user.id) || (active && now - attempt.lastSeenAt.getTime() < 45_000),
+      startedAt: attempt?.startedAt ?? null,
+      deadline: attempt?.deadline ?? null,
+      submittedAt: attempt?.submittedAt ?? null,
+      answeredCount: attempt?._count.answers ?? 0,
+      questionCount: attempt ? (JSON.parse(attempt.questionOrder) as string[]).length : exam.questionCount,
+      online: recentSessions.has(user.id) || (active && now - attempt.lastSeenAt.getTime() < 45_000)
+    };
+  });
 });
 
 app.post("/api/admin/attempts/:id/extend", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
@@ -555,9 +667,11 @@ app.post("/api/admin/attempts/:id/extend", { preHandler: [requireCsrf, requireAd
   if (typeof body.minutes !== "number" || !Number.isInteger(body.minutes) || body.minutes < 1 || body.minutes > 240) {
     return reply.code(400).send({ error: "Extension must be a whole number of minutes from 1 to 240." });
   }
+  const current = await prisma.examAttempt.findUnique({ where: { id } });
+  if (!current || current.status !== "IN_PROGRESS") return reply.code(404).send({ error: "Active attempt not found." });
   const attempt = await prisma.examAttempt.update({
-    where: { id, status: "IN_PROGRESS" },
-    data: { deadline: { increment: body.minutes * 60_000 } }
+    where: { id },
+    data: { deadline: new Date(current.deadline.getTime() + body.minutes * 60_000) }
   });
   await audit(request.auth!.userId, "exam_attempt.extended", "ExamAttempt", id, { minutes: body.minutes });
   return { id: attempt.id, deadline: attempt.deadline };
@@ -630,11 +744,6 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
   }
   let attempt = await prisma.examAttempt.findUnique({ where: { examId_userId: { examId: id, userId: request.auth!.userId } } });
   if (attempt && attempt.status !== "IN_PROGRESS") return reply.code(409).send({ error: "This exam attempt has already been submitted." });
-  if (attempt?.status === "IN_PROGRESS" && now > new Date(attempt.deadline.getTime() + submissionGraceSeconds * 1_000)) {
-    attempt = await prisma.examAttempt.update({ where: { id: attempt.id }, data: { status: "SUBMITTED", submittedAt: attempt.deadline } });
-    return reply.code(409).send({ error: "The exam deadline has passed. Your saved answers are awaiting final submission." });
-  }
-
   let selectedQuestions = exam.items.map(({ question }) => question);
   if (!selectedQuestions.length) {
     const rules = JSON.parse(exam.selectionRules) as {
@@ -721,7 +830,8 @@ app.post("/api/student/attempts/:id/heartbeat", { preHandler: [requireCsrf, requ
     data: { lastSeenAt: new Date() }
   });
   if (!updated.count) return reply.code(404).send({ error: "Active attempt not found." });
-  return { ok: true };
+  const attempt = await prisma.examAttempt.findUniqueOrThrow({ where: { id } });
+  return { ok: true, deadline: attempt.deadline, serverTime: new Date() };
 });
 
 app.post("/api/student/attempts/:id/events", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
@@ -761,9 +871,12 @@ app.post("/api/student/answers", { preHandler: [requireCsrf, requireStudent] }, 
   if (!question) return reply.code(400).send({ error: "Question no longer exists." });
   const validOptionIds = new Set((JSON.parse(question.options) as Array<{ id: string }>).map(({ id: optionId }) => optionId));
   if (submission.selectedOptionIds.some((optionId) => !validOptionIds.has(optionId))) return reply.code(400).send({ error: "Answer contains an invalid option." });
-  const existingEvent = await prisma.syncEvent.findUnique({ where: { idempotencyKey: submission.idempotencyKey } });
-  if (existingEvent) return { ok: true, duplicate: true };
   const payloadHash = createHash("sha256").update(JSON.stringify(submission)).digest("hex");
+  const existingEvent = await prisma.syncEvent.findUnique({ where: { idempotencyKey: submission.idempotencyKey } });
+  if (existingEvent) {
+    if (!isSameIdempotentPayload(existingEvent.payloadHash, payloadHash)) return reply.code(409).send({ error: "Idempotency key was already used for a different answer." });
+    return { ok: true, duplicate: true };
+  }
   try {
     await prisma.$transaction([
       prisma.syncEvent.create({
@@ -782,7 +895,11 @@ app.post("/api/student/answers", { preHandler: [requireCsrf, requireStudent] }, 
       prisma.examAttempt.update({ where: { id: attempt.id }, data: { lastSeenAt: new Date() } })
     ]);
   } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") return { ok: true, duplicate: true };
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") {
+      const racedEvent = await prisma.syncEvent.findUnique({ where: { idempotencyKey: submission.idempotencyKey } });
+      if (racedEvent && isSameIdempotentPayload(racedEvent.payloadHash, payloadHash)) return { ok: true, duplicate: true };
+      return reply.code(409).send({ error: "Idempotency key was already used for a different answer." });
+    }
     throw error;
   }
   return { ok: true, duplicate: false };
@@ -872,7 +989,7 @@ app.get("/api/student/results/:id/review", { preHandler: requireStudent }, async
 
 app.get("/api/student/results", { preHandler: requireStudent }, async (request: AuthenticatedRequest) =>
   prisma.examAttempt.findMany({
-    where: { userId: request.auth!.userId, status: { in: ["GRADED", "VOID"] } },
+    where: { userId: request.auth!.userId, status: "GRADED" },
     select: { id: true, status: true, score: true, submittedAt: true, exam: { select: { title: true } } },
     orderBy: { submittedAt: "desc" }
   })
@@ -887,8 +1004,8 @@ app.get("/api/admin/lan", { preHandler: requireAdmin }, async (request) => {
 
 app.setErrorHandler((error, _request, reply) => {
   app.log.error(error);
-  if (error.code === "P2002") return reply.code(409).send({ error: "A record with that value already exists." });
-  if (error.code === "P2025") return reply.code(404).send({ error: "Record not found." });
+  if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") return reply.code(409).send({ error: "A record with that value already exists." });
+  if (typeof error === "object" && error !== null && "code" in error && error.code === "P2025") return reply.code(404).send({ error: "Record not found." });
   return reply.code(500).send({ error: "An unexpected server error occurred." });
 });
 
@@ -911,14 +1028,13 @@ async function createFirstAdmin(): Promise<void> {
 
 async function start(): Promise<void> {
   await prisma.$connect();
-  await prisma.$executeRawUnsafe("PRAGMA journal_mode=WAL");
+  await prisma.$queryRawUnsafe("PRAGMA journal_mode=WAL");
   await prisma.$executeRawUnsafe("PRAGMA synchronous=FULL");
   await ensureBranding();
   await createFirstAdmin();
   await app.register(fastifyStatic, {
     root: path.resolve("../web/dist"),
-    prefix: "/",
-    decorateReply: false
+    prefix: "/"
   });
   app.setNotFoundHandler((request, reply) => {
     if (request.method === "GET" && !request.url.startsWith("/api/")) return reply.sendFile("index.html");

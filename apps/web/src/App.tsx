@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Papa from "papaparse";
 import { QRCodeSVG } from "qrcode.react";
@@ -59,7 +59,7 @@ function App() {
 
   const authQuery = useQuery({
     queryKey: ["me"],
-    queryFn: () => api<{ user: User }>("/api/auth/me"),
+    queryFn: () => api<{ user: User | null }>("/api/auth/me"),
     retry: false
   });
 
@@ -177,7 +177,7 @@ function ChangePasswordPage({ user }: { user: User }) {
       <h1>Change your temporary password</h1>
       <p>Welcome, {user.displayName}. Set a new password before continuing.</p>
       {error && <ErrorNotice message={error} />}
-      {done ? <div className="notice notice-success">Password changed. Please refresh this page and sign in again.</div> :
+      {done ? <div className="notice notice-success">Password changed. Refresh this page to continue.</div> :
         <form className="form-stack" onSubmit={(event) => { event.preventDefault(); mutation.mutate(); }}>
           <label>Temporary password<input autoComplete="current-password" type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} required /></label>
           <label>New password (at least 10 characters)<input autoComplete="new-password" type="password" minLength={10} value={newPassword} onChange={(event) => setNewPassword(event.target.value)} required /></label>
@@ -203,7 +203,7 @@ function Shell({ user, branding, page, onPage, onLogout, children }: {
   page: Page;
   onPage: (page: Page) => void;
   onLogout: () => void;
-  children: React.ReactNode;
+  children: ReactNode;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const navigation = user.role === "ADMIN"
@@ -233,7 +233,7 @@ function Shell({ user, branding, page, onPage, onLogout, children }: {
   </div>;
 }
 
-function PageHeader({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: React.ReactNode }) {
+function PageHeader({ eyebrow, title, description, action }: { eyebrow?: string; title: string; description?: string; action?: ReactNode }) {
   return <div className="page-header"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</div>;
 }
 
@@ -279,7 +279,7 @@ function DashboardPage() {
   </div>;
 }
 
-function StatCard({ label, value, icon: Icon, trend }: { label: string; value: React.ReactNode; icon: typeof Users; trend: string }) {
+function StatCard({ label, value, icon: Icon, trend }: { label: string; value: ReactNode; icon: typeof Users; trend: string }) {
   return <article className="card stat-card"><div className="stat-top"><span>{label}</span><i><Icon size={18} /></i></div><strong className="stat-value">{value}</strong><small>{trend}</small></article>;
 }
 
@@ -368,7 +368,7 @@ function StudentsPage() {
   });
   const reset = useMutation({
     mutationFn: (student: StudentRecord) => api<{ student: User; temporaryPassword: string }>(`/api/admin/students/${student.id}/reset-password`, { method: "POST", body: "{}" }),
-    onSuccess: ({ student, temporaryPassword }) => setCredential({ name: student.displayName, username: student.username, password: temporaryPassword })
+    onSuccess: ({ student, temporaryPassword }) => setCredentials([{ name: student.displayName, username: student.username, password: temporaryPassword }])
   });
   const printSlip = () => window.print();
   return <div className="page-stack"><PageHeader eyebrow="LEARNER MANAGEMENT" title="Students" description="Issue student accounts, reset passwords and assign classes." action={<button className="button button-outline" onClick={printSlip}><Printer size={16} />Print login slips</button>} />
@@ -406,19 +406,33 @@ function QuestionsPage() {
   const questions = useQuery({ queryKey: ["questions"], queryFn: () => api<QuestionRecord[]>("/api/admin/questions") });
   const [search, setSearch] = useState("");
   const [topicFilter, setTopicFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+  const [difficultyFilter, setDifficultyFilter] = useState("");
   const [error, setError] = useState("");
   const [importMessage, setImportMessage] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<QuestionRecord | null>(null);
   const filtered = useMemo(() => questions.data?.filter((question) =>
-    question.stem.toLowerCase().includes(search.toLowerCase()) && (!topicFilter || question.topicId === topicFilter)
-  ) ?? [], [questions.data, search, topicFilter]);
+    question.stem.toLowerCase().includes(search.toLowerCase())
+      && (!topicFilter || question.topicId === topicFilter)
+      && (!statusFilter || question.status === statusFilter)
+      && (!difficultyFilter || question.difficulty === Number(difficultyFilter))
+  ) ?? [], [questions.data, search, topicFilter, statusFilter, difficultyFilter]);
   const download = () => {
     if (!questions.data) return;
     const payload = questions.data.map(({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status }) =>
       ({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status }));
     const url = URL.createObjectURL(new Blob([JSON.stringify({ questions: payload }, null, 2)], { type: "application/json" }));
     const anchor = document.createElement("a"); anchor.href = url; anchor.download = "chemarena-questions.json"; anchor.click(); URL.revokeObjectURL(url);
+  };
+  const downloadCsv = () => {
+    if (!questions.data) return;
+    const payload = questions.data.map(({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, status }) => ({
+      stem, type, options: JSON.stringify(options), correctOptionIds: JSON.stringify(correctOptionIds),
+      explanation, topicId, difficulty, tags: JSON.stringify(tags), smiles: smiles ?? "", status
+    }));
+    const url = URL.createObjectURL(new Blob([Papa.unparse(payload)], { type: "text/csv;charset=utf-8" }));
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = "chemarena-questions.csv"; anchor.click(); URL.revokeObjectURL(url);
   };
   const importFile = async (file?: File) => {
     if (!file) return;
@@ -438,12 +452,12 @@ function QuestionsPage() {
     onSuccess: () => void client.invalidateQueries({ queryKey: ["questions"] }),
     onError: (e: Error) => setError(e.message)
   });
-  return <div className="page-stack"><PageHeader eyebrow="CONTENT LIBRARY" title="Question bank" description="Browse and import beginner-friendly organic chemistry questions." action={<><button className="button button-outline" onClick={() => { setEditing(null); setEditorOpen(true); }}><Plus size={16} />New question</button><button className="button button-outline" onClick={download}><Download size={16} />Export JSON</button><label className="button button-primary file-button"><FileUp size={16} />Import JSON / CSV<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></label></>} />
+  return <div className="page-stack"><PageHeader eyebrow="CONTENT LIBRARY" title="Question bank" description="Browse and import beginner-friendly organic chemistry questions." action={<><button className="button button-outline" onClick={() => { setEditing(null); setEditorOpen(true); }}><Plus size={16} />New question</button><button className="button button-outline" onClick={download}><Download size={16} />Export JSON</button><button className="button button-outline" onClick={downloadCsv}><Download size={16} />Export CSV</button><label className="button button-primary file-button"><FileUp size={16} />Import JSON / CSV<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></label></>} />
     {error && <ErrorNotice message={error} />}{importMessage && <div className="notice notice-success">{importMessage}</div>}
     {editorOpen && topics.data && <QuestionEditor initial={editing} topics={topics.data} onCancel={() => setEditorOpen(false)} onSaved={() => {
       setEditorOpen(false); setError(""); void client.invalidateQueries({ queryKey: ["questions"] });
     }} />}
-    <section className="card filter-bar"><label className="grow">Search<input placeholder="Search question text…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><label>Topic<select value={topicFilter} onChange={(event) => setTopicFilter(event.target.value)}><option value="">All syllabus topics</option>{topics.data?.map((topic) => <option key={topic.id} value={topic.id}>{topic.parentId ? `— ${topic.title}` : topic.title}</option>)}</select></label></section>
+    <section className="card filter-bar"><label className="grow">Search<input placeholder="Search question text…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><label>Topic<select value={topicFilter} onChange={(event) => setTopicFilter(event.target.value)}><option value="">All syllabus topics</option>{topics.data?.map((topic) => <option key={topic.id} value={topic.id}>{topic.parentId ? `— ${topic.title}` : topic.title}</option>)}</select></label><label>Status<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option><option value="DRAFT">Draft</option><option value="APPROVED">Approved</option></select></label><label>Difficulty<select value={difficultyFilter} onChange={(event) => setDifficultyFilter(event.target.value)}><option value="">All</option>{[1,2,3,4,5].map((level) => <option key={level} value={level}>{level}</option>)}</select></label></section>
     <section className="question-list">{filtered.map((question, index) => <article className="card question-card" key={question.id}><div className="question-meta"><span className="question-number">{String(index + 1).padStart(2, "0")}</span><span className="topic-chip">{question.topic.title}</span><StatusPill status={question.status} /><span className="difficulty">Level {question.difficulty}</span><button className="button button-outline button-small" onClick={() => { setEditing(question); setEditorOpen(true); }}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Delete this question? This cannot be undone.")) deleteQuestion.mutate(question); }}>Delete</button></div>
       <h3>{question.stem}</h3><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div>
       {question.smiles && <SmilesPreview smiles={question.smiles} />}
@@ -526,7 +540,7 @@ function QuestionEditor({ initial, topics, onCancel, onSaved }: {
 
 function SmilesPreview({ smiles }: { smiles: string }) {
   const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
-  const canvasRef = React.useRef<HTMLCanvasElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   useEffect(() => {
     let cancelled = false;
     setStatus("loading");
@@ -573,20 +587,63 @@ function downloadStudentTemplate(): void {
 }
 
 function SyllabusPage() {
+  const client = useQueryClient();
   const topics = useQuery({ queryKey: ["coverage"], queryFn: () => api<TopicRecord[]>("/api/admin/coverage") });
   const parents = topics.data?.filter((topic) => !topic.parentId) ?? [];
-  return <div className="page-stack"><PageHeader eyebrow="SYLLABUS COVERAGE" title="Competition syllabus" description="Coverage is grouped by the 10 official chapters and the learning outcomes shown in the supplied syllabus." />
+  const [editor, setEditor] = useState<{ topic: TopicRecord | null; parentId: string | null } | null>(null);
+  const [error, setError] = useState("");
+  const remove = useMutation({
+    mutationFn: (topic: TopicRecord) => api(`/api/admin/topics/${topic.id}`, { method: "DELETE" }),
+    onSuccess: () => { setError(""); void client.invalidateQueries({ queryKey: ["coverage"] }); void client.invalidateQueries({ queryKey: ["topics"] }); },
+    onError: (e: Error) => setError(e.message)
+  });
+  return <div className="page-stack"><PageHeader eyebrow="SYLLABUS COVERAGE" title="Competition syllabus" description="Edit the 10 official chapters and learning outcomes shown in the supplied syllabus." action={<button className="button button-primary" onClick={() => setEditor({ topic: null, parentId: null })}><Plus size={16} />Add chapter</button>} />
     <div className="coverage-summary card"><BookOpen /><div><strong>{parents.length} chapters in the source syllabus</strong><p>Questions and lessons are tagged to learning-outcome topics beneath each chapter.</p></div></div>
     {topics.isError && <ErrorNotice message={(topics.error as Error).message} />}
+    {error && <ErrorNotice message={error} />}
+    {editor && <TopicEditor topic={editor.topic} parentId={editor.parentId} parents={parents} onCancel={() => setEditor(null)} onSaved={() => {
+      setEditor(null); setError(""); void client.invalidateQueries({ queryKey: ["coverage"] }); void client.invalidateQueries({ queryKey: ["topics"] });
+    }} />}
     <div className="coverage-list">{parents.map((parent, index) => {
       const children = topics.data?.filter((topic) => topic.parentId === parent.id) ?? [];
       const questionTotal = children.reduce((sum, topic) => sum + (topic.approvedQuestions ?? 0), 0);
       const lessonTotal = children.reduce((sum, topic) => sum + (topic.publishedLessons ?? 0), 0);
-      return <section className="card chapter-card" key={parent.id}><div className="chapter-title"><span className="chapter-index">{String(index + 1).padStart(2, "0")}</span><div><h2>{parent.title}</h2><span>{questionTotal} approved questions · {lessonTotal} published lessons</span></div><span className={`coverage-indicator ${questionTotal ? "coverage-has" : ""}`} /></div>
-        <div className="outcome-list">{children.map((topic) => <div className="outcome-row" key={topic.id}><span>{topic.title}</span><span>{topic.approvedQuestions ?? 0} questions · {topic.publishedLessons ?? 0} lessons</span></div>)}</div>
+      return <section className="card chapter-card" key={parent.id}><div className="chapter-title"><span className="chapter-index">{String(index + 1).padStart(2, "0")}</span><div><h2>{parent.title}</h2><span>{questionTotal} approved questions · {lessonTotal} published lessons</span></div><span className={`coverage-indicator ${questionTotal ? "coverage-has" : ""}`} /><button className="button button-outline button-small" onClick={() => setEditor({ topic: null, parentId: parent.id })}><Plus size={13} />Outcome</button><button className="button button-outline button-small" onClick={() => setEditor({ topic: parent, parentId: null })}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm(`Delete chapter "${parent.title}"?`)) remove.mutate(parent); }}>Delete</button></div>
+        <div className="outcome-list">{children.map((topic) => <div className="outcome-row" key={topic.id}><span>{topic.title}</span><span>{topic.approvedQuestions ?? 0} questions · {topic.publishedLessons ?? 0} lessons</span><button className="button button-outline button-small" onClick={() => setEditor({ topic, parentId: parent.id })}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm(`Delete learning outcome "${topic.title}"?`)) remove.mutate(topic); }}>Delete</button></div>)}</div>
       </section>;
     })}</div>
   </div>;
+}
+
+function TopicEditor({ topic, parentId, parents, onCancel, onSaved }: {
+  topic: TopicRecord | null;
+  parentId: string | null;
+  parents: TopicRecord[];
+  onCancel: () => void;
+  onSaved: () => void;
+}) {
+  const [title, setTitle] = useState(topic?.title ?? "");
+  const [description, setDescription] = useState(topic?.description ?? "");
+  const [selectedParentId, setSelectedParentId] = useState(parentId ?? "");
+  const [error, setError] = useState("");
+  const mutation = useMutation({
+    mutationFn: () => api(topic ? `/api/admin/topics/${topic.id}` : "/api/admin/topics", {
+      method: topic ? "PUT" : "POST",
+      body: JSON.stringify({ title, description, parentId: selectedParentId || null })
+    }),
+    onSuccess: onSaved,
+    onError: (e: Error) => setError(e.message)
+  });
+  return <section className="card topic-editor"><div className="table-title"><h2>{topic ? "Edit syllabus topic" : parentId ? "Add learning outcome" : "Add syllabus chapter"}</h2><button className="icon-button" onClick={onCancel} aria-label="Close editor"><X size={17} /></button></div>
+    {error && <ErrorNotice message={error} />}
+    <form className="editor-form" onSubmit={(event) => { event.preventDefault(); mutation.mutate(); }}>
+      <label>Title<input value={title} onChange={(event) => setTitle(event.target.value)} required maxLength={180} /></label>
+      <label>Description / learning outcomes<textarea value={description} onChange={(event) => setDescription(event.target.value)} maxLength={2000} rows={3} /></label>
+      {!topic && <label>Parent chapter<select value={selectedParentId} onChange={(event) => setSelectedParentId(event.target.value)}><option value="">Top-level chapter</option>{parents.map((parent) => <option key={parent.id} value={parent.id}>{parent.title}</option>)}</select></label>}
+      {topic?.parentId && <p className="helper-text">Learning outcomes cannot be moved between chapters in this editor.</p>}
+      <div className="editor-actions"><button type="button" className="button button-outline" onClick={onCancel}>Cancel</button><button className="button button-primary" disabled={mutation.isPending}>{mutation.isPending ? "Saving…" : topic ? "Save topic" : "Create topic"}</button></div>
+    </form>
+  </section>;
 }
 
 function SettingsPage({ branding, onSaved }: { branding: Branding; onSaved: (branding: Branding) => void }) {
@@ -669,9 +726,9 @@ function ExamsPage() {
     </section>
     {selectedExam && <section className="card table-card monitor-card"><div className="table-title"><div><span className="eyebrow">LIVE EXAM MONITOR</span><h2>Student attempts</h2></div><span className="live-label"><i /> Refreshes every 3 seconds</span></div>
       {monitor.error && <ErrorNotice message={(monitor.error as Error).message} />}
-      <div className="table-wrap"><table><thead><tr><th>Student</th><th>Status</th><th>Progress</th><th>Connection</th><th>Deadline</th><th>Actions</th></tr></thead><tbody>
-        {monitor.data?.map((attempt) => <tr key={attempt.id}><td className="strong-cell">{attempt.user.displayName}<small className="table-subtitle">{attempt.user.username}</small></td><td><StatusPill status={attempt.status} /></td><td>{attempt.answeredCount} / {attempt.questionCount}</td><td><span className={`connection-pill ${attempt.online ? "online" : "offline"}`}><i />{attempt.online ? "Online" : "Offline"}</span></td><td>{new Date(attempt.deadline).toLocaleTimeString()}</td><td className="action-cell">{attempt.status === "IN_PROGRESS" && <><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "extend" })}>+5 min</button><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "reset" })}>Reset</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Void this exam attempt?")) updateAttempt.mutate({ attempt, action: "void" }); }}>Void</button></>}</td></tr>)}
-        {!monitor.data?.length && <EmptyRow columns={6} text={monitor.isLoading ? "Loading live attempts…" : "No students have started this exam."} />}
+      <div className="table-wrap"><table><thead><tr><th>Student</th><th>Joined</th><th>Status</th><th>Progress</th><th>Connection</th><th>Deadline</th><th>Actions</th></tr></thead><tbody>
+        {monitor.data?.map((attempt) => <tr key={attempt.user.id}><td className="strong-cell">{attempt.user.displayName}<small className="table-subtitle">{attempt.user.username}</small></td><td>{attempt.joined ? <StatusPill status="ACTIVE" /> : <span className="muted">—</span>}</td><td><StatusPill status={attempt.status} /></td><td>{attempt.answeredCount} / {attempt.questionCount}</td><td><span className={`connection-pill ${attempt.online ? "online" : "offline"}`}><i />{attempt.online ? "Online" : "Offline"}</span></td><td>{attempt.deadline ? new Date(attempt.deadline).toLocaleTimeString() : "—"}</td><td className="action-cell">{attempt.id && attempt.status === "IN_PROGRESS" && <><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "extend" })}>+5 min</button><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "reset" })}>Reset</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Void this exam attempt?")) updateAttempt.mutate({ attempt, action: "void" }); }}>Void</button></>}</td></tr>)}
+        {!monitor.data?.length && <EmptyRow columns={7} text={monitor.isLoading ? "Loading live attempts…" : "No students are assigned to this exam."} />}
       </tbody></table></div>
     </section>}
   </div>;
@@ -686,10 +743,11 @@ type ExamRecord = {
   classes: Array<{ class: { id: string; name: string } }>;
 };
 type AttemptRecord = {
-  id: string;
+  id: string | null;
   user: { id: string; displayName: string; username: string };
   status: string;
-  deadline: string;
+  joined: boolean;
+  deadline: string | null;
   answeredCount: number;
   questionCount: number;
   online: boolean;
@@ -764,6 +822,12 @@ function ExamBuilder({ questions, topics, classes, onCancel, onCreate, busy }: {
 }
 
 function StudentPage() {
+  useEffect(() => {
+    const heartbeat = () => void api("/api/auth/heartbeat", { method: "POST", body: "{}" }).catch(() => undefined);
+    heartbeat();
+    const timer = window.setInterval(heartbeat, 15_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const exams = useQuery({ queryKey: ["student-exams"], queryFn: () => api<Array<{ id: string; title: string; description: string; durationMinutes: number; opensAt: string | null; closesAt: string | null }>>("/api/student/exams") });
   const results = useQuery({ queryKey: ["student-results"], queryFn: () => api<Array<{ id: string; status: string; score: number | null; submittedAt: string | null; exam: { title: string } }>>("/api/student/results") });
   const [player, setPlayer] = useState<ExamPackage | null>(null);
@@ -833,23 +897,23 @@ function createIdempotencyKey(): string {
 function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: () => void }) {
   const [current, setCurrent] = useState(0);
   const [answers, setAnswers] = useState(examPackage.answers);
-  const answersRef = React.useRef(answers);
+  const answersRef = useRef(answers);
   const [flags, setFlags] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem(`flags:${examPackage.attemptId}`) ?? "[]") as string[]; } catch { return []; }
   });
   const [remaining, setRemaining] = useState(() => Math.max(0, Date.parse(examPackage.deadline) - Date.parse(examPackage.serverTime)));
-  const timerStarted = React.useRef(performance.now());
-  const initialRemaining = React.useRef(remaining);
-  const timeoutIds = React.useRef(new Map<string, number>());
-  const savePromises = React.useRef(new Map<string, Promise<void>>());
+  const timerStarted = useRef(performance.now());
+  const initialRemaining = useRef(remaining);
+  const timeoutIds = useRef(new Map<string, number>());
+  const savePromises = useRef(new Map<string, Promise<void>>());
   const [saveState, setSaveState] = useState<"saved" | "saving" | "offline">("saved");
   const [prompt, setPrompt] = useState(true);
   const [fullScreenWarning, setFullScreenWarning] = useState("");
   const [result, setResult] = useState<{ score: number; maxScore: number; topicBreakdown: Array<{ topic: TopicRecord; correct: number; total: number; score: number }> } | null>(null);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const submittedRef = React.useRef(false);
-  const timerExpiredRef = React.useRef(false);
+  const submittedRef = useRef(false);
+  const timerExpiredRef = useRef(false);
   const currentQuestion = examPackage.questions[current]!;
 
   useEffect(() => {
@@ -867,14 +931,39 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
         body: JSON.stringify({ eventType: document.hidden ? "TAB_HIDDEN" : "TAB_VISIBLE" })
       }).catch(() => undefined);
     };
+    const fullscreenchange = () => {
+      if (!document.fullscreenElement) {
+        void api(`/api/student/attempts/${examPackage.attemptId}/events`, {
+          method: "POST",
+          body: JSON.stringify({ eventType: "FULLSCREEN_EXIT" })
+        }).catch(() => undefined);
+      }
+    };
+    const heartbeat = window.setInterval(() => {
+      void api<{ deadline: string; serverTime: string }>(`/api/student/attempts/${examPackage.attemptId}/heartbeat`, { method: "POST", body: "{}" })
+        .then(({ deadline, serverTime }) => {
+          const serverRemaining = Math.max(0, Date.parse(deadline) - Date.parse(serverTime));
+          const localRemaining = Math.max(0, initialRemaining.current - (performance.now() - timerStarted.current));
+          if (serverRemaining < localRemaining || serverRemaining - localRemaining > 1_000) {
+            initialRemaining.current = serverRemaining;
+            timerStarted.current = performance.now();
+            setRemaining(serverRemaining);
+          }
+          setSaveState((state) => state === "offline" ? "saved" : state);
+        })
+        .catch(() => setSaveState("offline"));
+    }, 15_000);
     const onOnline = () => {
       void Promise.all([...savePromises.current.values()]).then(() => setSaveState("saved")).catch(() => setSaveState("offline"));
     };
     document.addEventListener("visibilitychange", visibility);
+    document.addEventListener("fullscreenchange", fullscreenchange);
     window.addEventListener("online", onOnline);
     return () => {
       window.clearInterval(timer);
+      window.clearInterval(heartbeat);
       document.removeEventListener("visibilitychange", visibility);
+      document.removeEventListener("fullscreenchange", fullscreenchange);
       window.removeEventListener("online", onOnline);
       timeoutIds.current.forEach((timeout) => window.clearTimeout(timeout));
     };
@@ -964,7 +1053,8 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
     const totalSeconds = Math.ceil(milliseconds / 1_000);
     return `${String(Math.floor(totalSeconds / 60)).padStart(2, "0")}:${String(totalSeconds % 60).padStart(2, "0")}`;
   };
-  const onClipboard = (event: React.ClipboardEvent) => event.preventDefault();
+  const onClipboard = (event: ClipboardEvent) => event.preventDefault();
+  const onContextMenu = (event: MouseEvent) => event.preventDefault();
 
   if (result) return <div className="page-stack result-page"><PageHeader eyebrow="EXAM COMPLETE" title="Your result" description={examPackage.exam.title} />
     <section className="card result-score"><span className="eyebrow">TOTAL SCORE</span><strong>{result.score} <small>/ {result.maxScore}</small></strong><p>Your exam has been graded by the server.</p></section>
@@ -972,7 +1062,7 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
     <button className="button button-primary" onClick={onExit}>Return to my learning</button>
   </div>;
 
-  return <div className="cbt-screen" onCopy={onClipboard} onCut={onClipboard} onPaste={onClipboard} onContextMenu={onClipboard}>
+  return <div className="cbt-screen" onCopy={onClipboard} onCut={onClipboard} onPaste={onClipboard} onContextMenu={onContextMenu}>
     {prompt && <div className="exam-prompt"><div className="card exam-prompt-card"><span className="eyebrow">READY TO BEGIN</span><h1>{examPackage.exam.title}</h1><p>This timed exam lasts {examPackage.exam.durationMinutes} minutes. Your deadline is set by the server. Answers are saved as you go.</p><p className="prompt-warning">Do not close this page. If your connection drops, notify the administrator before submitting.</p>{fullScreenWarning && <div className="notice notice-error">{fullScreenWarning}</div>}
       <button className="button button-primary button-full" onClick={() => void startFullScreen()}>Enter full screen and begin</button><button className="button button-outline button-full" onClick={() => setPrompt(false)}>Continue without full screen</button></div></div>}
     <header className="cbt-header"><div><span className="eyebrow">COMPUTER-BASED TEST</span><h1>{examPackage.exam.title}</h1></div><div className="cbt-header-right"><span className={`save-status save-${saveState}`}><i />{saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : "Offline — not synced"}</span><div className={`countdown ${remaining < 60_000 ? "countdown-urgent" : ""}`}><span>TIME LEFT</span><strong>{formatTime(remaining)}</strong></div></div></header>
