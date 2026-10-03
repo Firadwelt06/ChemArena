@@ -74,6 +74,16 @@ Passwords are generated locally and shown once in the terminal. Students must ch
 
 The provided syllabus image does **not** specify exam question count, duration or marking. Those values are chosen for each exam in the builder; ChemArena does not invent official exam-format rules.
 
+### Adding questions in batches
+
+Open **Question bank → Import a batch**:
+
+1. **Spreadsheet/CSV:** download the ChemArena question template, add one question per row, and upload it. Use the exact chapter and learning-outcome names shown on the Syllabus page. Fill `optionA` through `optionD` (optionally `optionE` through `optionH`), and set `correctAnswers` to option letters such as `A` or `A;C` for a multi-answer question. Set `type` to `SINGLE`, `MULTI` or `TRUE_FALSE`, `difficulty` from 1 to 5, and tags as comma-separated text. PapaParse handles quoted commas/newlines in cells.
+2. **AI-assisted authoring:** copy the prompt shown in the batch importer, paste it into an AI chat (no ChemArena API key is needed), then paste the returned JSON into the preview. Ask for manageable batches, review chemistry accuracy and distractors yourself, and generate more batches for uncovered syllabus outcomes.
+3. **Validate and review:** ChemArena checks the question shape and exact chapter/outcome match, shows invalid rows and warns about exact duplicate stems already in the bank or earlier in the batch. Uncheck anything you do not want. Selected batch imports are always created as **Draft**; then review each question and mark it Approved individually in the question editor before it can appear in exams.
+
+For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, `stem`, `type`, `options` as `{ "id": "a", "text": "..." }` objects, `correctOptionIds` as option IDs, `explanation`, `difficulty`, `tags`, and optional `smiles`. Chapter and outcome must match the Syllabus page. This import process flags exact normalized stem matches; it cannot determine whether two differently worded questions test the same idea or whether an answer is scientifically defensible, so teacher review remains essential. Legacy question CSV exports using internal `topicId` values and JSON-encoded option cells are still accepted.
+
 ## Data and security notes
 
 - The SQLite database is at `apps/server/prisma/chemarena.db`. Keep the laptop plugged in during exams and include that directory in normal system backups.

@@ -7,6 +7,13 @@ import {
   LayoutDashboard, LogOut, Menu, Plus, Printer, RefreshCw, Settings, ShieldCheck, Users, X
 } from "lucide-react";
 import { api, setCsrfToken, type Branding, type User } from "./api";
+import {
+  createQuestionPrompt,
+  findDuplicateWarnings,
+  parseQuestionCsv,
+  parseQuestionJson,
+  type QuestionImportRow
+} from "./questionImport";
 
 type Page = "overview" | "classes" | "students" | "questions" | "syllabus" | "exams" | "settings";
 type Dashboard = { studentCount: number; classCount: number; questionCount: number; activeExams: number; attempts: number };
@@ -410,6 +417,10 @@ function QuestionsPage() {
   const [difficultyFilter, setDifficultyFilter] = useState("");
   const [error, setError] = useState("");
   const [importMessage, setImportMessage] = useState("");
+  const [jsonText, setJsonText] = useState("");
+  const [importRows, setImportRows] = useState<QuestionImportRow[]>([]);
+  const [selectedImportRows, setSelectedImportRows] = useState<number[]>([]);
+  const [promptMessage, setPromptMessage] = useState("");
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<QuestionRecord | null>(null);
   const filtered = useMemo(() => questions.data?.filter((question) =>
@@ -427,36 +438,160 @@ function QuestionsPage() {
   };
   const downloadCsv = () => {
     if (!questions.data) return;
-    const payload = questions.data.map(({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, status }) => ({
-      stem, type, options: JSON.stringify(options), correctOptionIds: JSON.stringify(correctOptionIds),
-      explanation, topicId, difficulty, tags: JSON.stringify(tags), smiles: smiles ?? "", status
-    }));
+    const payload = questions.data.map((question) => {
+      const topic = topics.data?.find((item) => item.id === question.topicId);
+      const chapter = topic?.parentId ? topics.data?.find((item) => item.id === topic.parentId) : topic;
+      return {
+        chapter: chapter?.title ?? "",
+        outcome: topic?.parentId ? topic.title : "",
+        stem: question.stem,
+        type: question.type,
+        ...Object.fromEntries(["a", "b", "c", "d", "e", "f", "g", "h"].map((id, index) => [
+          `option${id.toUpperCase()}`,
+          question.options[index]?.text ?? ""
+        ])),
+        correctAnswers: question.correctOptionIds
+          .map((id) => {
+            const optionIndex = question.options.findIndex((option) => option.id === id);
+            return optionIndex < 0 ? "" : String.fromCharCode(65 + optionIndex);
+          })
+          .filter(Boolean)
+          .join(";"),
+        explanation: question.explanation,
+        difficulty: question.difficulty,
+        tags: question.tags.join(", "),
+        smiles: question.smiles ?? ""
+      };
+    });
     const url = URL.createObjectURL(new Blob([Papa.unparse(payload)], { type: "text/csv;charset=utf-8" }));
     const anchor = document.createElement("a"); anchor.href = url; anchor.download = "chemarena-questions.csv"; anchor.click(); URL.revokeObjectURL(url);
   };
   const importFile = async (file?: File) => {
     if (!file) return;
-    setImportMessage("");
     try {
       const text = await file.text();
-      const data: unknown = file.name.toLowerCase().endsWith(".csv") ? parseCsv(text) : JSON.parse(text);
-      const questionList = Array.isArray(data) ? data : data && typeof data === "object" && "questions" in data ? (data as { questions: unknown }).questions : null;
-      if (!Array.isArray(questionList)) throw new Error("File must contain a JSON array or an object with a questions array.");
-      const result = await api<{ imported: number }>("/api/admin/questions/import", { method: "POST", body: JSON.stringify({ questions: questionList }) });
-      setImportMessage(`${result.imported} question${result.imported === 1 ? "" : "s"} imported.`);
-      await client.invalidateQueries({ queryKey: ["questions"] });
+      const rows = file.name.toLowerCase().endsWith(".csv")
+        ? parseQuestionCsv(text, topics.data ?? [])
+        : parseQuestionJson(text, topics.data ?? []);
+      stageImport(rows);
+      setError("");
     } catch (e) { setError(e instanceof Error ? e.message : "Could not import that file."); }
+  };
+  const stageImport = (rows: QuestionImportRow[]) => {
+    const stagedRows = rows.map((row) => {
+      if (!row.question) return row;
+      const warnings = row.question.status === "APPROVED"
+        ? [...row.warnings, "Imported as Draft; review and approve it in the question editor."]
+        : row.warnings;
+      return { ...row, question: { ...row.question, status: "DRAFT" as const }, warnings };
+    });
+    const withWarnings = findDuplicateWarnings(stagedRows, questions.data?.map((question) => question.stem) ?? []);
+    setImportRows(withWarnings);
+    setSelectedImportRows(withWarnings.filter((row) => row.question).map((row) => row.rowNumber));
+    setImportMessage("");
+  };
+  const previewJson = () => {
+    try {
+      stageImport(parseQuestionJson(jsonText, topics.data ?? [], true));
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not parse the question JSON.");
+    }
+  };
+  const importSelected = async () => {
+    const questionsToImport = importRows
+      .filter((row) => row.question && selectedImportRows.includes(row.rowNumber))
+      .map((row) => ({ ...row.question!, status: "DRAFT" as const }));
+    if (!questionsToImport.length) {
+      setError("Select at least one valid question to import.");
+      return;
+    }
+    try {
+      const result = await api<{ imported: number }>("/api/admin/questions/import", {
+        method: "POST",
+        body: JSON.stringify({ questions: questionsToImport })
+      });
+      setImportMessage(`${result.imported} question${result.imported === 1 ? "" : "s"} imported as Draft for review.`);
+      setImportRows([]);
+      setSelectedImportRows([]);
+      setJsonText("");
+      setError("");
+      await client.invalidateQueries({ queryKey: ["questions"] });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not import the selected questions.");
+    }
+  };
+  const downloadQuestionTemplate = () => {
+    const exampleChapter = topics.data?.find((topic) => !topic.parentId);
+    const exampleOutcome = topics.data?.find((topic) => topic.parentId === exampleChapter?.id);
+    const example = exampleChapter && exampleOutcome
+      ? [{
+          chapter: exampleChapter.title,
+          outcome: exampleOutcome.title,
+          stem: "Which formula represents a saturated acyclic hydrocarbon with three carbon atoms?",
+          type: "SINGLE",
+          optionA: "C3H8",
+          optionB: "C3H6",
+          optionC: "C3H4",
+          optionD: "C2H6",
+          correctAnswers: "A",
+          explanation: "Acyclic alkanes have the general formula CnH2n+2.",
+          difficulty: 1,
+          tags: "alkanes, molecular formula",
+          smiles: ""
+        }]
+      : [];
+    const csv = Papa.unparse(example.length ? example : [{
+      chapter: "", outcome: "", stem: "", type: "SINGLE", optionA: "", optionB: "", optionC: "", optionD: "",
+      correctAnswers: "", explanation: "", difficulty: 1, tags: "", smiles: ""
+    }]);
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "chemarena-question-template.csv";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+  const copyPrompt = async () => {
+    try {
+      await navigator.clipboard.writeText(createQuestionPrompt(topics.data ?? []));
+      setPromptMessage("Prompt copied. Paste it into your AI chat, then paste its JSON response below.");
+    } catch {
+      setPromptMessage("Clipboard access is unavailable. Open the prompt below and copy it manually.");
+    }
   };
   const deleteQuestion = useMutation({
     mutationFn: (question: QuestionRecord) => api(`/api/admin/questions/${question.id}`, { method: "DELETE" }),
     onSuccess: () => void client.invalidateQueries({ queryKey: ["questions"] }),
     onError: (e: Error) => setError(e.message)
   });
-  return <div className="page-stack"><PageHeader eyebrow="CONTENT LIBRARY" title="Question bank" description="Browse and import beginner-friendly organic chemistry questions." action={<><button className="button button-outline" onClick={() => { setEditing(null); setEditorOpen(true); }}><Plus size={16} />New question</button><button className="button button-outline" onClick={download}><Download size={16} />Export JSON</button><button className="button button-outline" onClick={downloadCsv}><Download size={16} />Export CSV</button><label className="button button-primary file-button"><FileUp size={16} />Import JSON / CSV<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></label></>} />
+  return <div className="page-stack"><PageHeader eyebrow="CONTENT LIBRARY" title="Question bank" description="Browse, write or batch-create syllabus-aligned questions." action={<><button className="button button-outline" onClick={() => { setEditing(null); setEditorOpen(true); }}><Plus size={16} />New question</button><button className="button button-outline" onClick={download}><Download size={16} />Export JSON</button><button className="button button-outline" onClick={downloadCsv}><Download size={16} />Export CSV</button></>} />
     {error && <ErrorNotice message={error} />}{importMessage && <div className="notice notice-success">{importMessage}</div>}
     {editorOpen && topics.data && <QuestionEditor initial={editing} topics={topics.data} onCancel={() => setEditorOpen(false)} onSaved={() => {
       setEditorOpen(false); setError(""); void client.invalidateQueries({ queryKey: ["questions"] });
     }} />}
+    <section className="card batch-import">
+      <div className="table-title"><div><span className="eyebrow">BUILD YOUR BANK</span><h2>Import a batch</h2></div><button className="button button-outline button-small" onClick={() => void copyPrompt()}>Copy AI prompt</button></div>
+      <p className="batch-intro">Fill the spreadsheet template yourself, or use the prompt with an AI chat and paste its JSON response here. Imports are staged for review and created as Draft; nothing is automatically approved.</p>
+      <div className="batch-actions"><button className="button button-outline" onClick={downloadQuestionTemplate}><Download size={16} />Download spreadsheet template</button><label className="button button-outline file-button"><FileUp size={16} />Review CSV / JSON file<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></label></div>
+      <details className="prompt-details"><summary>View AI prompt and exact JSON format</summary><textarea readOnly rows={10} value={createQuestionPrompt(topics.data ?? [])} /></details>
+      {promptMessage && <p className="helper-text" role="status">{promptMessage}</p>}
+      <label>Paste an AI-generated JSON batch<textarea className="json-paste" value={jsonText} onChange={(event) => setJsonText(event.target.value)} placeholder={'{"questions":[{"chapter":"exact chapter title","outcome":"exact learning outcome","stem":"...","type":"SINGLE","options":[{"id":"a","text":"..."},{"id":"b","text":"..."},{"id":"c","text":"..."},{"id":"d","text":"..."}],"correctOptionIds":["a"],"explanation":"...","difficulty":2,"tags":["..."],"smiles":null}]}'} rows={5} /></label>
+      <div className="batch-actions"><button className="button button-primary" onClick={previewJson} disabled={!jsonText.trim()}>Validate and preview JSON</button></div>
+      {importRows.length > 0 && <div className="import-review">
+        <div className="table-title"><div><h3>Review import batch</h3><span className="muted">{importRows.filter((row) => row.question).length} valid · {importRows.filter((row) => row.issues.length).length} need fixes · {importRows.filter((row) => row.warnings.length).length} duplicate or review warnings</span></div>
+          <button className="button button-primary button-small" onClick={() => void importSelected()} disabled={!selectedImportRows.length}>Import {selectedImportRows.length} as Draft</button>
+        </div>
+        <div className="import-rows">{importRows.map((row) => <label className={`import-row ${row.issues.length ? "import-row-invalid" : ""}`} key={row.rowNumber}>
+          <input type="checkbox" checked={Boolean(row.question && selectedImportRows.includes(row.rowNumber))} disabled={!row.question} onChange={(event) => setSelectedImportRows((current) => event.target.checked ? [...current, row.rowNumber] : current.filter((number) => number !== row.rowNumber))} />
+          <span className="import-row-index">#{row.rowNumber}</span>
+          <span className="import-row-content">{row.question?.stem ?? row.issues.join(" ")}</span>
+          {row.question && <span className="topic-chip">{topics.data?.find((topic) => topic.id === row.question?.topicId)?.title ?? "Topic"}</span>}
+          {row.warnings.map((warning) => <small className="import-warning" key={warning}>{warning}</small>)}
+          {row.question && <StatusPill status={row.question.status} />}
+        </label>)}</div>
+      </div>}
+    </section>
     <section className="card filter-bar"><label className="grow">Search<input placeholder="Search question text…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><label>Topic<select value={topicFilter} onChange={(event) => setTopicFilter(event.target.value)}><option value="">All syllabus topics</option>{topics.data?.map((topic) => <option key={topic.id} value={topic.id}>{topic.parentId ? `— ${topic.title}` : topic.title}</option>)}</select></label><label>Status<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option><option value="DRAFT">Draft</option><option value="APPROVED">Approved</option></select></label><label>Difficulty<select value={difficultyFilter} onChange={(event) => setDifficultyFilter(event.target.value)}><option value="">All</option>{[1,2,3,4,5].map((level) => <option key={level} value={level}>{level}</option>)}</select></label></section>
     <section className="question-list">{filtered.map((question, index) => <article className="card question-card" key={question.id}><div className="question-meta"><span className="question-number">{String(index + 1).padStart(2, "0")}</span><span className="topic-chip">{question.topic.title}</span><StatusPill status={question.status} /><span className="difficulty">Level {question.difficulty}</span><button className="button button-outline button-small" onClick={() => { setEditing(question); setEditorOpen(true); }}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Delete this question? This cannot be undone.")) deleteQuestion.mutate(question); }}>Delete</button></div>
       <h3>{question.stem}</h3><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div>
@@ -555,30 +690,6 @@ function SmilesPreview({ smiles }: { smiles: string }) {
     return () => { cancelled = true; };
   }, [smiles]);
   return <div className="smiles-preview"><span>Structure preview</span>{status === "loading" && <small>Rendering structure…</small>}{status === "error" && <small role="alert">Could not render this SMILES string.</small>}<canvas ref={canvasRef} width={340} height={180} hidden={status !== "ready"} /></div>;
-}
-
-function parseCsv(input: string): unknown[] {
-  const parsed = Papa.parse<string[]>(input, { skipEmptyLines: true });
-  if (parsed.errors.length) throw new Error(parsed.errors[0]?.message ?? "CSV parsing failed.");
-  const rows = parsed.data;
-  const headers = rows.shift()?.map((header) => header.trim().toLowerCase()) ?? [];
-  const required = ["stem", "options", "correctoptionids", "explanation", "topicid"];
-  if (required.some((column) => !headers.includes(column))) throw new Error(`CSV must include columns: ${required.join(", ")}.`);
-  return rows.map((row) => {
-    const value = (name: string) => row[headers.indexOf(name)] ?? "";
-    return {
-      stem: value("stem"),
-      type: value("type") || "SINGLE",
-      options: JSON.parse(value("options")),
-      correctOptionIds: JSON.parse(value("correctoptionids")),
-      explanation: value("explanation"),
-      topicId: value("topicid"),
-      difficulty: Number(value("difficulty") || 1),
-      tags: value("tags") ? JSON.parse(value("tags")) : [],
-      smiles: value("smiles") || null,
-      status: value("status") || "DRAFT"
-    };
-  });
 }
 
 function downloadStudentTemplate(): void {
