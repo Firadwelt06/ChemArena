@@ -1,6 +1,7 @@
 import "dotenv/config";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, copyFile } from "node:fs/promises";
+import { copyFile, mkdir, readdir, rename, rm, stat } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import path from "node:path";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
@@ -8,7 +9,7 @@ import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import argon2 from "argon2";
 import { PrismaClient, Role, RecordStatus } from "@prisma/client";
-import { AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, hasRole, isSameIdempotentPayload, LoginSchema, QuestionSchema, scoreAnswer, StudentImportSchema, TopicInputSchema } from "@chemarena/shared";
+import { AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, FinalExamSubmissionSchema, hasRole, isSameIdempotentPayload, LoginSchema, QuestionSchema, scoreAnswer, StudentImportSchema, TopicInputSchema } from "@chemarena/shared";
 
 const prisma = new PrismaClient();
 const app = Fastify({ logger: true, trustProxy: false, bodyLimit: 2_000_000 });
@@ -26,6 +27,68 @@ const host = process.env.HOST ?? "0.0.0.0";
 const sessionDurationMs = 12 * 60 * 60 * 1_000;
 const sessionCookie = "chemarena_session";
 const submissionGraceSeconds = integerSetting("SUBMISSION_GRACE_SECONDS", 60, 0, 300);
+const automaticBackupIntervalMinutes = integerSetting("AUTO_BACKUP_INTERVAL_MINUTES", 15, 1, 1_440);
+let automaticBackupTimer: ReturnType<typeof setInterval> | undefined;
+let automaticBackupInProgress = false;
+let backupQueue: Promise<void> = Promise.resolve();
+let finalSubmissionQueue: Promise<void> = Promise.resolve();
+const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
+const serverDirectory = path.resolve(moduleDirectory, path.basename(path.dirname(moduleDirectory)) === "dist" ? "../.." : "..");
+const backupDirectory = process.env.BACKUP_DIRECTORY?.trim()
+  ? path.resolve(process.env.BACKUP_DIRECTORY)
+  : path.resolve(serverDirectory, "../../backups");
+
+function databaseFilePath(): string {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl?.startsWith("file:")) throw new Error("DATABASE_URL must use a SQLite file: URL.");
+  const relativePath = decodeURIComponent(databaseUrl.slice("file:".length).split("?")[0] ?? "");
+  return path.isAbsolute(relativePath) ? path.resolve(relativePath) : path.resolve(serverDirectory, "prisma", relativePath);
+}
+
+function safeSqliteLiteral(value: string): string {
+  return value.replaceAll("'", "''");
+}
+
+async function serializeFinalSubmission<T>(submit: () => Promise<T>): Promise<T> {
+  const previous = finalSubmissionQueue;
+  let release!: () => void;
+  finalSubmissionQueue = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    return await submit();
+  } finally {
+    release();
+  }
+}
+
+function backupName(kind: "manual" | "auto"): string {
+  return `chemarena-${kind}-${new Date().toISOString().replaceAll(":", "-")}-${randomBytes(3).toString("hex")}.db`;
+}
+
+function createSqliteBackup(kind: "manual" | "auto"): Promise<string> {
+  const operation = backupQueue.then(async () => {
+    await mkdir(backupDirectory, { recursive: true });
+    const filename = backupName(kind);
+    const destination = path.join(backupDirectory, filename);
+    await prisma.$queryRawUnsafe("PRAGMA wal_checkpoint(FULL)");
+    await prisma.$executeRawUnsafe(`VACUUM INTO '${safeSqliteLiteral(destination)}'`);
+    return filename;
+  });
+  backupQueue = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+async function pruneAutomaticBackups(): Promise<void> {
+  const filenames = await readdir(backupDirectory);
+  const cutoff = Date.now() - 7 * 24 * 60 * 60 * 1_000;
+  await Promise.all(filenames
+    .filter((filename) => /^chemarena-auto-[0-9T.Za-f-]+\.db$/.test(filename))
+    .map(async (filename) => {
+      const filePath = path.join(backupDirectory, filename);
+      const info = await stat(filePath);
+      if (info.mtimeMs < cutoff) await rm(filePath);
+    }));
+}
 
 type AuthenticatedRequest = FastifyRequest & {
   auth?: { userId: string; role: Role; csrfToken: string; sessionId: string; mustChangePassword: boolean };
@@ -128,6 +191,49 @@ async function audit(actorId: string, action: string, entityType: string, entity
   });
 }
 
+async function gradedSummary(attemptId: string) {
+  const attempt = await prisma.examAttempt.findUnique({
+    where: { id: attemptId },
+    include: { exam: true, answers: true }
+  });
+  if (!attempt || attempt.status !== "GRADED") throw new Error("Graded attempt not found.");
+  const questionIds = JSON.parse(attempt.questionOrder) as string[];
+  const questions = await prisma.question.findMany({
+    where: { id: { in: questionIds } },
+    select: { id: true, topicId: true, correctOptionIds: true }
+  });
+  const questionMap = new Map(questions.map((question) => [question.id, question]));
+  const answerMap = new Map(attempt.answers.map((answer) => [answer.questionId, JSON.parse(answer.selectedOptionIds) as string[]]));
+  const breakdown = new Map<string, { topicId: string; correct: number; total: number; score: number }>();
+  for (const questionId of questionIds) {
+    const question = questionMap.get(questionId);
+    if (!question) continue;
+    const earned = scoreAnswer(
+      JSON.parse(question.correctOptionIds) as string[],
+      answerMap.get(questionId) ?? [],
+      attempt.exam.marksPerQuestion,
+      attempt.exam.negativeMarking ? attempt.exam.negativeMarks : 0
+    );
+    const topicScore = breakdown.get(question.topicId) ?? { topicId: question.topicId, correct: 0, total: 0, score: 0 };
+    topicScore.total += 1;
+    topicScore.score += earned;
+    if (earned > 0) topicScore.correct += 1;
+    breakdown.set(question.topicId, topicScore);
+  }
+  const topics = await prisma.topic.findMany({
+    where: { id: { in: [...breakdown.keys()] } },
+    select: { id: true, title: true, parentId: true }
+  });
+  const topicMap = new Map(topics.map((topic) => [topic.id, topic]));
+  return {
+    id: attempt.id,
+    status: "GRADED",
+    score: attempt.score ?? 0,
+    maxScore: questionIds.length * attempt.exam.marksPerQuestion,
+    topicBreakdown: [...breakdown.values()].map((entry) => ({ ...entry, topic: topicMap.get(entry.topicId) }))
+  };
+}
+
 async function ensureBranding(): Promise<void> {
   const defaults = {
     schoolName: "ChemArena",
@@ -146,7 +252,10 @@ async function ensureBranding(): Promise<void> {
 app.register(cookie);
 app.register(rateLimit, { global: false });
 
-app.get("/api/health", async () => ({ ok: true }));
+app.get("/api/health", async () => {
+  await prisma.$queryRawUnsafe("SELECT 1");
+  return { ok: true, serverTime: new Date() };
+});
 
 app.get("/api/auth/csrf", async (request, reply) => {
   const sessionId = readCookie(request);
@@ -701,16 +810,90 @@ app.get("/api/admin/audit", { preHandler: requireAdmin }, async () =>
   prisma.auditLog.findMany({ orderBy: { createdAt: "desc" }, take: 500, include: { actor: { select: { username: true, displayName: true } } } })
 );
 
-app.post("/api/admin/backup", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest) => {
-  const source = process.env.DATABASE_URL?.replace(/^file:/, "");
-  if (!source) throw new Error("DATABASE_URL is not configured.");
-  const sourcePath = path.resolve("apps/server", source);
-  const backupDirectory = path.resolve("backups");
+app.get("/api/admin/backups", { preHandler: requireAdmin }, async () => {
   await mkdir(backupDirectory, { recursive: true });
-  const filename = `chemarena-manual-${new Date().toISOString().replaceAll(":", "-")}.db`;
-  await copyFile(sourcePath, path.join(backupDirectory, filename));
+  const filenames = await readdir(backupDirectory);
+  const backups = await Promise.all(filenames
+    .filter((filename) => /^chemarena-(?:manual|auto)-[0-9T.Za-f-]+\.db$/.test(filename))
+    .map(async (filename) => {
+      const info = await stat(path.join(backupDirectory, filename));
+      return { filename, sizeBytes: info.size, createdAt: info.mtime.toISOString() };
+    }));
+  return {
+    automaticBackupIntervalMinutes,
+    backups: backups.sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  };
+});
+
+app.post("/api/admin/backup", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest) => {
+  const filename = await createSqliteBackup("manual");
   await audit(request.auth!.userId, "backup.created", "Backup", filename);
   return { filename };
+});
+
+app.post("/api/admin/restore", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const body = request.body as { filename?: unknown };
+  if (typeof body.filename !== "string" || !/^chemarena-(?:manual|auto)-[0-9T.Za-f-]+\.db$/.test(body.filename)) {
+    return reply.code(400).send({ error: "Choose a valid ChemArena backup." });
+  }
+  const filename = path.basename(body.filename);
+  const sourcePath = path.resolve(backupDirectory, filename);
+  if (path.dirname(sourcePath) !== backupDirectory) return reply.code(400).send({ error: "Invalid backup path." });
+  const sourceInfo = await stat(sourcePath).catch(() => null);
+  if (!sourceInfo?.isFile() || sourceInfo.size === 0) return reply.code(404).send({ error: "Backup file not found or empty." });
+
+  const validationClient = new PrismaClient({
+    datasources: { db: { url: `file:${sourcePath.replaceAll("\\", "/")}` } }
+  });
+  try {
+    const integrity = await validationClient.$queryRawUnsafe<Array<{ integrity_check: string }>>("PRAGMA integrity_check");
+    const tables = await validationClient.$queryRawUnsafe<Array<{ name: string }>>(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('User', 'ExamAttempt', 'Answer')"
+    );
+    if (integrity[0]?.integrity_check !== "ok" || tables.length !== 3) {
+      return reply.code(400).send({ error: "This file is not a valid ChemArena database backup." });
+    }
+  } finally {
+    await validationClient.$disconnect();
+  }
+
+  const safetyBackup = await createSqliteBackup("manual");
+  await audit(request.auth!.userId, "backup.restore_requested", "Backup", filename, { safetyBackup });
+  reply.code(202).send({
+    ok: true,
+    restarting: true,
+    safetyBackup,
+    message: "The server will restart and restore this backup. Sign in again when ChemArena is available."
+  });
+  setTimeout(() => {
+    void (async () => {
+      const activePath = databaseFilePath();
+      const stagedPath = `${activePath}.restore-${process.pid}`;
+      const previousPath = `${activePath}.previous-${process.pid}`;
+      await copyFile(sourcePath, stagedPath);
+      if (automaticBackupTimer) clearInterval(automaticBackupTimer);
+      await backupQueue;
+      await prisma.$queryRawUnsafe("PRAGMA wal_checkpoint(TRUNCATE)");
+      await app.close();
+      await prisma.$disconnect();
+      await rm(`${activePath}-wal`, { force: true });
+      await rm(`${activePath}-shm`, { force: true });
+      await rename(activePath, previousPath);
+      try {
+        await rename(stagedPath, activePath);
+        await rm(previousPath, { force: true });
+        process.exit(75);
+      } catch (error) {
+        await rename(previousPath, activePath);
+        await rm(stagedPath, { force: true });
+        throw error;
+      }
+    })().catch((error: unknown) => {
+      app.log.error(error, "ChemArena backup restore failed.");
+      process.exit(75);
+    });
+  }, 500);
+  return reply;
 });
 
 app.get("/api/student/exams", { preHandler: requireStudent }, async (request: AuthenticatedRequest) => {
@@ -905,19 +1088,88 @@ app.post("/api/student/answers", { preHandler: [requireCsrf, requireStudent] }, 
   return { ok: true, duplicate: false };
 });
 
-app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
+app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) =>
+  serializeFinalSubmission(async () => {
   const { id } = request.params as { id: string };
+  const parsed = FinalExamSubmissionSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid final answer snapshot." });
+  const submission = parsed.data;
   const attempt = await prisma.examAttempt.findFirst({
     where: { id, userId: request.auth!.userId },
     include: { exam: true, answers: true }
   });
   if (!attempt) return reply.code(404).send({ error: "Attempt not found." });
-  if (attempt.status === "GRADED") return { id: attempt.id, status: attempt.status, score: attempt.score };
-  if (attempt.status !== "IN_PROGRESS") return reply.code(409).send({ error: "Attempt cannot be submitted." });
+  if (attempt.status === "GRADED") return gradedSummary(attempt.id);
+  if (attempt.status !== "IN_PROGRESS" && attempt.status !== "SUBMITTED") return reply.code(409).send({ error: "Attempt cannot be submitted." });
   const questionIds = JSON.parse(attempt.questionOrder) as string[];
+  const submittedQuestionIds = Object.keys(submission.answers);
+  if (submittedQuestionIds.length !== questionIds.length || questionIds.some((questionId) => !(questionId in submission.answers))) {
+    return reply.code(400).send({ error: "The final snapshot must include every question in this attempt." });
+  }
   const questions = await prisma.question.findMany({ where: { id: { in: questionIds } } });
   const questionMap = new Map(questions.map((question) => [question.id, question]));
-  const answerMap = new Map(attempt.answers.map((answer) => [answer.questionId, JSON.parse(answer.selectedOptionIds) as string[]]));
+  for (const [questionId, selectedOptionIds] of Object.entries(submission.answers)) {
+    const question = questionMap.get(questionId);
+    if (!question) return reply.code(400).send({ error: "The snapshot contains a question outside this attempt." });
+    const validOptionIds = new Set((JSON.parse(question.options) as Array<{ id: string }>).map(({ id: optionId }) => optionId));
+    if (selectedOptionIds.some((optionId) => !validOptionIds.has(optionId))) {
+      return reply.code(400).send({ error: "The final snapshot contains an invalid option." });
+    }
+  }
+  const snapshotPayload = JSON.stringify(Object.fromEntries(
+    Object.entries(submission.answers).sort(([left], [right]) => left.localeCompare(right))
+  ));
+  const payloadHash = createHash("sha256").update(snapshotPayload).digest("hex");
+  const priorEvent = await prisma.syncEvent.findUnique({ where: { idempotencyKey: submission.idempotencyKey } });
+  if (priorEvent && (
+    priorEvent.attemptId !== id
+    || priorEvent.eventType !== "FINAL_SNAPSHOT"
+    || !isSameIdempotentPayload(priorEvent.payloadHash, payloadHash)
+  )) {
+    return reply.code(409).send({ error: "This submission key was already used for different data." });
+  }
+  if (attempt.status === "SUBMITTED" && !priorEvent) {
+    return reply.code(409).send({ error: "A final answer snapshot has already been accepted for this attempt." });
+  }
+  if (!priorEvent) {
+    try {
+      await prisma.$transaction(async (transaction) => {
+        const accepted = await transaction.examAttempt.updateMany({
+          where: { id, userId: request.auth!.userId, status: "IN_PROGRESS" },
+          data: { status: "SUBMITTED" }
+        });
+        if (!accepted.count) throw new Error("FINAL_SNAPSHOT_ALREADY_ACCEPTED");
+        await transaction.syncEvent.create({
+          data: {
+            attemptId: id,
+            idempotencyKey: submission.idempotencyKey,
+            eventType: "FINAL_SNAPSHOT",
+            payloadHash
+          }
+        });
+        await Promise.all(questionIds.map((questionId) => transaction.answer.upsert({
+          where: { attemptId_questionId: { attemptId: id, questionId } },
+          create: { attemptId: id, questionId, selectedOptionIds: JSON.stringify(submission.answers[questionId]) },
+          update: { selectedOptionIds: JSON.stringify(submission.answers[questionId]) }
+        })));
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "FINAL_SNAPSHOT_ALREADY_ACCEPTED") {
+        const acceptedEvent = await prisma.syncEvent.findUnique({ where: { idempotencyKey: submission.idempotencyKey } });
+        if (!acceptedEvent || acceptedEvent.attemptId !== id || !isSameIdempotentPayload(acceptedEvent.payloadHash, payloadHash)) {
+          return reply.code(409).send({ error: "A different final answer snapshot was already accepted." });
+        }
+      } else if (typeof error === "object" && error !== null && "code" in error && error.code === "P2002") {
+        const racedEvent = await prisma.syncEvent.findUnique({ where: { idempotencyKey: submission.idempotencyKey } });
+        if (!racedEvent || racedEvent.attemptId !== id || !isSameIdempotentPayload(racedEvent.payloadHash, payloadHash)) {
+          return reply.code(409).send({ error: "This submission key was already used for different data." });
+        }
+      } else {
+        throw error;
+      }
+    }
+  }
+  const answerMap = new Map(Object.entries(submission.answers));
   let score = 0;
   const breakdown = new Map<string, { topicId: string; correct: number; total: number; score: number }>();
   for (const questionId of questionIds) {
@@ -938,10 +1190,14 @@ app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, require
   }
   const submittedAt = new Date();
   const updated = await prisma.examAttempt.updateMany({
-    where: { id, userId: request.auth!.userId, status: "IN_PROGRESS" },
+    where: { id, userId: request.auth!.userId, status: "SUBMITTED" },
     data: { status: "GRADED", score, submittedAt, lastSeenAt: submittedAt }
   });
-  if (!updated.count) return reply.code(409).send({ error: "Attempt was already submitted." });
+  if (!updated.count) {
+    const graded = await prisma.examAttempt.findUnique({ where: { id } });
+    if (graded?.status === "GRADED") return gradedSummary(id);
+    return reply.code(409).send({ error: "Attempt was already submitted." });
+  }
   await audit(request.auth!.userId, "exam_attempt.submitted", "ExamAttempt", id, { score });
   const topics = await prisma.topic.findMany({ where: { id: { in: [...breakdown.keys()] } }, select: { id: true, title: true, parentId: true } });
   const topicMap = new Map(topics.map((topic) => [topic.id, topic]));
@@ -952,7 +1208,8 @@ app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, require
     maxScore: questionIds.length * attempt.exam.marksPerQuestion,
     topicBreakdown: [...breakdown.values()].map((entry) => ({ ...entry, topic: topicMap.get(entry.topicId) }))
   };
-});
+  })
+);
 
 app.get("/api/student/results/:id/review", { preHandler: requireStudent }, async (request: AuthenticatedRequest, reply) => {
   const { id } = request.params as { id: string };
@@ -1041,9 +1298,19 @@ async function start(): Promise<void> {
     return reply.code(404).send({ error: "Route not found." });
   });
   await app.listen({ host, port });
+  automaticBackupTimer = setInterval(() => {
+    if (automaticBackupInProgress) return;
+    automaticBackupInProgress = true;
+    void createSqliteBackup("auto")
+      .then(() => pruneAutomaticBackups())
+      .catch((error: unknown) => app.log.error(error, "Automatic SQLite backup failed."))
+      .finally(() => { automaticBackupInProgress = false; });
+  }, automaticBackupIntervalMinutes * 60_000);
+  automaticBackupTimer.unref();
 }
 
 const shutdown = async () => {
+  if (automaticBackupTimer) clearInterval(automaticBackupTimer);
   await app.close();
   await prisma.$disconnect();
 };

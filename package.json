@@ -13,12 +13,16 @@
     "dev:web": "npm --workspace @chemarena/web run dev",
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
+    "test:e2e": "playwright test",
+    "load:test": "node scripts/load-test.mjs",
     "db:generate": "npm --workspace @chemarena/server run db:generate",
     "db:push": "npm --workspace @chemarena/server run db:push",
     "db:seed": "npm --workspace @chemarena/server run db:seed"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "concurrently": "^9.2.1",
+    "fake-indexeddb": "^6.2.5",
     "typescript": "^5.9.3"
   },
   "allowScripts": {

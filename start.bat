@@ -32,7 +32,9 @@ echo ChemArena is starting. Keep this window open.
 echo On this laptop: http://localhost:4174
 echo Students: ask the admin dashboard for the LAN join URL.
 echo.
+:run_server
 call npm run start --workspace @chemarena/server
+if errorlevel 75 if not errorlevel 76 goto :run_server
 if errorlevel 1 goto :failed
 exit /b 0
 

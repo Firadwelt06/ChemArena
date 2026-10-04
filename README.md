@@ -10,7 +10,7 @@ ChemArena is a LAN-first organic chemistry practice and CBT platform. A teacher'
 4. Open `http://localhost:4174` on the teacher laptop. The one-time admin password and seeded student login slips are printed in the server terminal during first-time setup. Save them and change the admin password after signing in.
 5. On the admin dashboard, share a listed LAN URL or its QR code. Students open it while connected to the same Wi-Fi/hotspot.
 
-The Linux/macOS launcher is [`start.sh`](./start.sh). Both launchers use the same default port, `4174`; edit `apps/server/.env` to change `PORT`, `HOST` or `SUBMISSION_GRACE_SECONDS`. The first launcher run creates that file from `apps/server/.env.example`.
+The Linux/macOS launcher is [`start.sh`](./start.sh). Both launchers use the same default port, `4174`; edit `apps/server/.env` to change `PORT`, `HOST`, `SUBMISSION_GRACE_SECONDS` or `AUTO_BACKUP_INTERVAL_MINUTES`. The first launcher run creates that file from `apps/server/.env.example`.
 
 ### npm install-script approval
 
@@ -62,7 +62,7 @@ First-time setup seeds:
 
 Passwords are generated locally and shown once in the terminal. Students must change their temporary password at first sign-in. To issue new student credentials later, use **Students → Reset password** or create accounts in the admin panel. Bulk student CSV headers are `displayName,username,class`; `class` must match an active class name. Download the in-app template for an example.
 
-## Current Phase 1 features
+## Phase 1 features
 
 - Argon2 password hashes, HTTP-only same-site session cookies, per-login rate limiting, CSRF headers on mutations, server-side role checks, account deactivation and forced temporary-password changes.
 - Editable school name, logo, colors and footer branding.
@@ -73,6 +73,51 @@ Passwords are generated locally and shown once in the terminal. Students must ch
 - SQLite in WAL mode with full synchronous writes.
 
 The provided syllabus image does **not** specify exam question count, duration or marking. Those values are chosen for each exam in the builder; ChemArena does not invent official exam-format rules.
+
+## Phase 2: resilience and LAN operation
+
+- Each started exam package is cached in the student's browser IndexedDB. Answer changes are written there immediately and queued in an idempotent outbox; retries run in the background and after reconnection. A refresh on the same device restores the latest local answers.
+- The player uses a monotonic countdown while open and corrects it with the server deadline whenever the server can be reached. At zero, it freezes one complete local answer snapshot and retries submission until the server confirms grading.
+- The server grades only after receiving that final snapshot. It accepts exactly one frozen final snapshot per attempt, including after the normal answer grace window, so a disconnected student can finish syncing. The server cannot prove when edits in an unsynced snapshot were made; this is a deliberate availability trade-off, not tamper-proof offline testing.
+- The **Saved / Saving / Offline — answers safe on this device** indicator distinguishes server acknowledgement from local-only answers. No service worker is used; students must keep the exam tab open during a network outage. If the browser or device closes while both the app server and LAN are unreachable, the app shell cannot be reopened over plain HTTP until the server is reachable again.
+- SQLite uses WAL mode and full synchronous writes. ChemArena makes a timestamped automatic database snapshot every 15 minutes by default and keeps automatic snapshots for 7 days; older automatic snapshots are removed, while manual snapshots are retained. Change the schedule with `AUTO_BACKUP_INTERVAL_MINUTES` in `apps/server/.env`.
+- Backups are written to the repository's `backups` folder by default. Set `BACKUP_DIRECTORY` in `apps/server/.env` to use another local folder or drive; keep it on storage with enough free space and include it in normal system backups.
+- **Settings → Backups and restore** creates a consistent one-click backup and lists restore points. Restore validates the SQLite database, creates a safety backup of the current database, then restarts the server. The Windows `start.bat` launcher restarts it automatically; sign in again after restore. A server started directly with `npm run start --workspace @chemarena/server` must be started again manually after a restore.
+- The login screen's **Test connection** button checks the server from the student's device. It confirms server reachability but cannot diagnose router client isolation from the laptop itself.
+
+### Load and network-drop tests
+
+Run the unit tests and build with:
+
+```powershell
+npm test
+npm run build
+```
+
+The Playwright network-drop test requires a running ChemArena server, Chromium (`npx playwright install chromium` once), a dedicated student account that has already changed its temporary password, and an assigned exam. It submits that account's exam attempt, so do not use a real student's active exam:
+
+```powershell
+$env:CHEMARENA_E2E_USERNAME = "offline-test-student"
+$env:CHEMARENA_E2E_PASSWORD = "use-a-disposable-password"
+npm run test:e2e
+```
+
+For the 60-student load test, prepare exactly 60 disposable student credentials and an exam assigned to those students or their class. Save credentials as a JSON array in a private local file (never commit or share it):
+
+```json
+[
+  { "username": "load-student-01", "password": "..." },
+  { "username": "load-student-02", "password": "..." }
+]
+```
+
+The actual file must contain all 60 accounts. The script limits simultaneous password verification to six logins to avoid a sharp Argon2 memory spike, then starts all attempts, autosaves one answer per student, and submits all attempts concurrently. Successful submissions consume those accounts' attempts; use a dedicated test exam and disposable accounts only.
+
+```powershell
+$env:LOAD_TEST_EXAM_ID = "your-dedicated-exam-id"
+$env:LOAD_TEST_USERS = ".\load-test-users.json"
+npm run load:test
+```
 
 ### Adding questions in batches
 
@@ -90,8 +135,10 @@ For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, 
 - Sessions and exam answers are stored locally; passwords are hashed. Do not share the `.env` file or database backups.
 - The LAN deployment uses plain HTTP as requested. Other people with access to an untrusted Wi-Fi network may be able to observe traffic; use a trusted, isolated school network and do not reuse personal passwords.
 - The exam package sent to a student does not contain correct-option IDs or explanations. Students can still inspect the question text and options delivered to their own browser; a client-side exam cannot prevent that.
-- **Phase 1 currently requires a working LAN connection for answer autosave and submission.** The resilient IndexedDB outbox, automatic backup schedule/restore and 60-student load test are planned for Phase 2. Do not treat this release as safe for an exam where students may lose connectivity for an extended period.
-- ChemArena does not register a service worker and does not claim browser/PWA offline operation over HTTP.
+- Answers can be changed while the exam is open without a server connection, but local browser storage is not a substitute for a separate laptop/database backup. Students should not clear browser data, use private browsing, switch devices mid-exam, or close the exam tab during a dropout.
+- Offline auto-submit stores and retries one frozen final snapshot. The server accepts that snapshot once even after the grace period because it cannot independently verify its client-side freeze time; a student who can modify browser storage or script requests may alter an unsynced snapshot. Answer keys and explanations remain server-side until grading.
+- Device clock changes cannot extend an attempt when online because the server deadline is authoritative and the in-page timer uses a monotonic clock. After a full browser restart while disconnected, elapsed-time recovery necessarily relies on the last saved server time and the device clock until reconnection.
+- ChemArena does not register a service worker and does not claim full browser/PWA offline operation over HTTP. A network drop during an already-open exam is supported; a disconnected browser cannot reload the app shell from the server.
 
 ## Development commands
 
@@ -137,8 +184,18 @@ npm run db:seed
 9. Submit the exam; confirm grading and topic breakdown appear, then review explanations. Verify a student cannot open admin APIs.
 10. In a second attempt, switch tabs and confirm the admin monitor records events without punishing the student.
 
+## Phase 2 manual test checklist
+
+1. On a disposable exam account and test exam, start the exam, answer a question, refresh while the server is reachable, and confirm the latest answer restores.
+2. Begin another test attempt, block the `/api/student/answers` request or disconnect Wi-Fi, change answers, and confirm the player shows **Offline — answers safe on this device** while the question navigator continues working.
+3. Reconnect before the deadline and confirm pending answers flush and the status returns to **Saved**.
+4. In a short-duration test exam, disconnect before the timer expires. Confirm the player freezes the answer snapshot at zero, keeps retrying submission, and displays the graded result after reconnecting—even when reconnection is after the configured grace period.
+5. As admin, create a manual backup in **Settings → Backups and restore**. Confirm it appears in the list alongside automatic backups.
+6. Restore a test backup. Confirm ChemArena restarts, requires sign-in again, and the database contents match the selected backup. Keep a separate backup of any data that must not be replaced.
+7. Open the join URL from a second device and use **Test connection** before an exam. Confirm a blocked firewall or client-isolated hotspot is diagnosed using the LAN troubleshooting steps above.
+8. On disposable data only, run the Playwright network-drop test and the 60-student load test. Review all reported failures and response-time percentiles.
+
 ## Later phases
 
-- **Phase 2:** offline answer outbox and reconnect sync, deadline/grace handling, student connectivity page, automatic/manual backups and restore, and 60-student load and network-drop tests.
 - **Phase 3:** lesson authoring/progress and reviewed, locally stored AI-assisted lesson/question generation.
 - **Phase 4:** student/admin analytics, reports, weak-topic practice sets and expanded audit views.

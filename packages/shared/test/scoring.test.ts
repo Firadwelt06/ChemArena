@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   AnswerSubmissionSchema,
   ExamInputSchema,
+  FinalExamSubmissionSchema,
   hasRole,
   isSameIdempotentPayload,
   isWithinSubmissionWindow,
@@ -66,6 +67,18 @@ describe("isWithinSubmissionWindow", () => {
         idempotencyKey: "ff201d54-7f3b-4c1a-9f3e-34c937ec5320", changedAt: 1
       });
       expect(result.success).toBe(false);
+    });
+
+    it("validates frozen final exam snapshots", () => {
+      const snapshot = {
+        idempotencyKey: "ff201d54-7f3b-4c1a-9f3e-34c937ec5320",
+        answers: { "question-1": ["a"], "question-2": [] }
+      };
+      expect(FinalExamSubmissionSchema.safeParse(snapshot).success).toBe(true);
+      expect(FinalExamSubmissionSchema.safeParse({
+        ...snapshot,
+        answers: { "question-1": ["a", "a"] }
+      }).success).toBe(false);
     });
 
     it("accepts top-level syllabus chapters and child outcomes", () => {

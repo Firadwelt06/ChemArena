@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Papa from "papaparse";
 import { QRCodeSVG } from "qrcode.react";
 import {
-  Activity, BookOpen, Boxes, ChevronRight, CircleHelp, Download, FileUp, FlaskConical, GraduationCap,
+  Activity, BookOpen, Boxes, ChevronRight, CircleHelp, Database, Download, FileUp, FlaskConical, GraduationCap,
   LayoutDashboard, LogOut, Menu, Plus, Printer, RefreshCw, Settings, ShieldCheck, Users, X
 } from "lucide-react";
 import { api, setCsrfToken, type Branding, type User } from "./api";
@@ -14,6 +14,19 @@ import {
   parseQuestionJson,
   type QuestionImportRow
 } from "./questionImport";
+import {
+  cacheExamPackage,
+  flushAnswerOutbox,
+  freezeSubmission,
+  getCachedAttempt,
+  getLatestCachedAttempt,
+  getPendingAnswerCount,
+  removeCachedAttempt,
+  saveAnswerLocally,
+  updateCachedServerTime,
+  type CachedExamAttempt,
+  type ExamPackage
+} from "./examStore";
 
 type Page = "overview" | "classes" | "students" | "questions" | "syllabus" | "exams" | "settings";
 type Dashboard = { studentCount: number; classCount: number; questionCount: number; activeExams: number; attempts: number };
@@ -109,7 +122,7 @@ function App() {
     <Shell user={user} branding={branding} page={page} onPage={setPage} onLogout={() => void logout()}>
       {user.role === "ADMIN"
         ? <AdminPage page={page} branding={branding} onBrandingSaved={(next) => queryClient.setQueryData(["branding"], next)} />
-        : <StudentPage />}
+        : <StudentPage user={user} />}
     </Shell>
   );
 }
@@ -788,7 +801,64 @@ function SettingsPage({ branding, onSaved }: { branding: Branding; onSaved: (bra
         <button className="button button-primary" disabled={save.isPending}><Settings size={16} />{save.isPending ? "Saving…" : "Save branding"}</button>
       </form>
     </section>
+    <BackupManager />
   </div>;
+}
+
+type BackupRecord = { filename: string; sizeBytes: number; createdAt: string };
+
+function BackupManager() {
+  const client = useQueryClient();
+  const backups = useQuery({
+    queryKey: ["backups"],
+    queryFn: () => api<{ automaticBackupIntervalMinutes: number; backups: BackupRecord[] }>("/api/admin/backups")
+  });
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const createBackup = useMutation({
+    mutationFn: () => api<{ filename: string }>("/api/admin/backup", { method: "POST", body: "{}" }),
+    onSuccess: ({ filename }) => {
+      setMessage(`Backup created: ${filename}`);
+      setError("");
+      void client.invalidateQueries({ queryKey: ["backups"] });
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
+  });
+  const restore = useMutation({
+    mutationFn: (filename: string) => api<{ message: string; safetyBackup: string }>("/api/admin/restore", {
+      method: "POST",
+      body: JSON.stringify({ filename })
+    }),
+    onSuccess: ({ message: responseMessage, safetyBackup }) => {
+      setError("");
+      setMessage(`${responseMessage} Current data was saved as ${safetyBackup}.`);
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
+  });
+  const formatSize = (sizeBytes: number) => sizeBytes < 1_000_000
+    ? `${Math.ceil(sizeBytes / 1_000)} KB`
+    : `${(sizeBytes / 1_000_000).toFixed(1)} MB`;
+  return <section className="card table-card backup-manager">
+    <div className="table-title"><div><span className="eyebrow">LOCAL DATABASE</span><h2>Backups and restore</h2></div>
+      <button className="button button-primary button-small" disabled={createBackup.isPending || restore.isPending} onClick={() => createBackup.mutate()}>
+        <Database size={16} />{createBackup.isPending ? "Creating…" : "Create backup"}
+      </button>
+    </div>
+    <p className="helper-text">Automatic backups are created every {backups.data?.automaticBackupIntervalMinutes ?? 15} minutes. Restoring replaces the current database, then restarts ChemArena; sign in again afterward.</p>
+    {error && <ErrorNotice message={error} />}{message && <div className="notice notice-success" role="status">{message}</div>}
+    {backups.error && <ErrorNotice message={(backups.error as Error).message} />}
+    <div className="table-wrap"><table><thead><tr><th>Backup</th><th>Created</th><th>Size</th><th>Action</th></tr></thead><tbody>
+      {backups.data?.backups.map((backup) => <tr key={backup.filename}>
+        <td className="strong-cell">{backup.filename}</td><td>{new Date(backup.createdAt).toLocaleString()}</td><td>{formatSize(backup.sizeBytes)}</td>
+        <td><button className="button button-outline button-small" disabled={restore.isPending || createBackup.isPending} onClick={() => {
+          if (window.confirm(`Restore ${backup.filename}? The current database will be replaced. ChemArena will restart and require you to sign in again.`)) {
+            restore.mutate(backup.filename);
+          }
+        }}>Restore</button></td>
+      </tr>)}
+      {!backups.data?.backups.length && <EmptyRow columns={4} text={backups.isLoading ? "Loading backups…" : "No automatic or manual backups have been created yet."} />}
+    </tbody></table></div>
+  </section>;
 }
 
 function ExamsPage() {
@@ -932,7 +1002,7 @@ function ExamBuilder({ questions, topics, classes, onCancel, onCreate, busy }: {
   </section>;
 }
 
-function StudentPage() {
+function StudentPage({ user }: { user: User }) {
   useEffect(() => {
     const heartbeat = () => void api("/api/auth/heartbeat", { method: "POST", body: "{}" }).catch(() => undefined);
     heartbeat();
@@ -941,7 +1011,7 @@ function StudentPage() {
   }, []);
   const exams = useQuery({ queryKey: ["student-exams"], queryFn: () => api<Array<{ id: string; title: string; description: string; durationMinutes: number; opensAt: string | null; closesAt: string | null }>>("/api/student/exams") });
   const results = useQuery({ queryKey: ["student-results"], queryFn: () => api<Array<{ id: string; status: string; score: number | null; submittedAt: string | null; exam: { title: string } }>>("/api/student/results") });
-  const [player, setPlayer] = useState<ExamPackage | null>(null);
+  const [player, setPlayer] = useState<CachedExamAttempt | null>(null);
   const [reviewId, setReviewId] = useState("");
   const [startError, setStartError] = useState("");
   const review = useQuery({
@@ -951,10 +1021,44 @@ function StudentPage() {
   });
   const start = useMutation({
     mutationFn: (examId: string) => api<ExamPackage>(`/api/student/exams/${examId}/start`, { method: "POST", body: "{}" }),
-    onSuccess: (data) => { setPlayer(data); setStartError(""); },
+    onSuccess: async (data) => {
+      try {
+        await cacheExamPackage(user.id, data);
+        const saved = await getCachedAttempt(data.attemptId);
+        if (!saved) throw new Error("The local exam package could not be confirmed.");
+        setPlayer(saved);
+        setStartError("");
+      } catch (error) {
+        setPlayer({
+          attemptId: data.attemptId,
+          userId: user.id,
+          examPackage: data,
+          answers: data.answers,
+          cachedAt: Date.now(),
+          serverTimeCachedAt: Date.now(),
+          frozenSubmission: null
+        });
+        setStartError(`This device could not save a local exam copy. Stay connected while taking this exam. ${error instanceof Error ? error.message : ""}`);
+      }
+    },
     onError: (error: Error) => setStartError(error.message)
   });
-  if (player) return <CBTPlayer examPackage={player} onExit={() => {
+  useEffect(() => {
+    let active = true;
+    void getLatestCachedAttempt(user.id).then((cached) => {
+      if (!active || !cached) return;
+      const elapsedSinceServerCheck = Math.max(0, Date.now() - cached.serverTimeCachedAt);
+      const adjustedServerTime = new Date(Date.parse(cached.examPackage.serverTime) + elapsedSinceServerCheck).toISOString();
+      setPlayer({
+        ...cached,
+        examPackage: { ...cached.examPackage, serverTime: adjustedServerTime }
+      });
+    }).catch((error: unknown) => {
+      if (active) setStartError(error instanceof Error ? error.message : "Could not open the exam saved on this device.");
+    });
+    return () => { active = false; };
+  }, [user.id]);
+  if (player) return <CBTPlayer cachedAttempt={player} onExit={() => {
     setPlayer(null);
     void results.refetch();
     void exams.refetch();
@@ -976,17 +1080,6 @@ function StudentPage() {
   </div>;
 }
 
-type ExamQuestion = { id: string; stem: string; type: string; smiles: string | null; imageDataUrl: string | null; options: Array<{ id: string; text: string }> };
-type ExamPackage = {
-  attemptId: string;
-  exam: { id: string; title: string; durationMinutes: number; marksPerQuestion: number };
-  startedAt: string;
-  deadline: string;
-  serverTime: string;
-  graceSeconds: number;
-  questions: ExamQuestion[];
-  answers: Record<string, string[]>;
-};
 type ReviewData = {
   examTitle: string;
   score: number | null;
@@ -1005,10 +1098,13 @@ function createIdempotencyKey(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: () => void }) {
+function CBTPlayer({ cachedAttempt, onExit }: { cachedAttempt: CachedExamAttempt; onExit: () => void }) {
+  const examPackage = cachedAttempt.examPackage;
   const [current, setCurrent] = useState(0);
-  const [answers, setAnswers] = useState(examPackage.answers);
+  const [answers, setAnswers] = useState(cachedAttempt.answers);
   const answersRef = useRef(answers);
+  const [isFrozen, setIsFrozen] = useState(Boolean(cachedAttempt.frozenSubmission));
+  const frozenSubmissionRef = useRef(cachedAttempt.frozenSubmission);
   const [flags, setFlags] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem(`flags:${examPackage.attemptId}`) ?? "[]") as string[]; } catch { return []; }
   });
@@ -1016,7 +1112,8 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
   const timerStarted = useRef(performance.now());
   const initialRemaining = useRef(remaining);
   const timeoutIds = useRef(new Map<string, number>());
-  const savePromises = useRef(new Map<string, Promise<void>>());
+  const localWritePromises = useRef(new Map<string, Promise<void>>());
+  const [pendingAnswerCount, setPendingAnswerCount] = useState(0);
   const [saveState, setSaveState] = useState<"saved" | "saving" | "offline">("saved");
   const [prompt, setPrompt] = useState(true);
   const [fullScreenWarning, setFullScreenWarning] = useState("");
@@ -1028,6 +1125,32 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
   const currentQuestion = examPackage.questions[current]!;
 
   useEffect(() => {
+    void getCachedAttempt(examPackage.attemptId).then((cached) => {
+      if (!cached) return;
+      answersRef.current = cached.answers;
+      setAnswers(cached.answers);
+      frozenSubmissionRef.current = cached.frozenSubmission;
+      setIsFrozen(Boolean(cached.frozenSubmission));
+      setPendingAnswerCount(0);
+      void getPendingAnswerCount(examPackage.attemptId).then(setPendingAnswerCount);
+    }).catch((error: unknown) => setError(error instanceof Error ? error.message : "Could not read the saved exam answers."));
+    const flushOutbox = async () => {
+      await flushAnswerOutbox(examPackage.attemptId, async (entry) => {
+        await api("/api/student/answers", {
+          method: "POST",
+          body: JSON.stringify({
+            attemptId: examPackage.attemptId,
+            questionId: entry.questionId,
+            selectedOptionIds: entry.selectedOptionIds,
+            idempotencyKey: entry.idempotencyKey,
+            changedAt: entry.changedAt
+          })
+        });
+      });
+      const count = await getPendingAnswerCount(examPackage.attemptId);
+      setPendingAnswerCount(count);
+      setSaveState(count ? "saving" : "saved");
+    };
     const timer = window.setInterval(() => {
       const left = Math.max(0, initialRemaining.current - (performance.now() - timerStarted.current));
       setRemaining(left);
@@ -1036,6 +1159,9 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
         void submit(true);
       }
     }, 250);
+    const retrySubmission = window.setInterval(() => {
+      if (frozenSubmissionRef.current && !submittedRef.current) void submit(true);
+    }, 5_000);
     const visibility = () => {
       void api(`/api/student/attempts/${examPackage.attemptId}/events`, {
         method: "POST",
@@ -1060,18 +1186,22 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
             timerStarted.current = performance.now();
             setRemaining(serverRemaining);
           }
-          setSaveState((state) => state === "offline" ? "saved" : state);
+          void updateCachedServerTime(examPackage.attemptId, serverTime);
+          if (frozenSubmissionRef.current) void submit(true);
+          else void flushOutbox().catch(() => setSaveState("offline"));
         })
         .catch(() => setSaveState("offline"));
     }, 15_000);
     const onOnline = () => {
-      void Promise.all([...savePromises.current.values()]).then(() => setSaveState("saved")).catch(() => setSaveState("offline"));
+      if (frozenSubmissionRef.current || timerExpiredRef.current) void submit(true);
+      else void flushOutbox().catch(() => setSaveState("offline"));
     };
     document.addEventListener("visibilitychange", visibility);
     document.addEventListener("fullscreenchange", fullscreenchange);
     window.addEventListener("online", onOnline);
     return () => {
       window.clearInterval(timer);
+      window.clearInterval(retrySubmission);
       window.clearInterval(heartbeat);
       document.removeEventListener("visibilitychange", visibility);
       document.removeEventListener("fullscreenchange", fullscreenchange);
@@ -1080,32 +1210,47 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
     };
   }, [examPackage.attemptId]);
 
-  const saveAnswer = async (questionId: string, selectedOptionIds: string[]) => {
-    const previous = savePromises.current.get(questionId);
-    const pending = (previous?.catch(() => undefined) ?? Promise.resolve()).then(async () => {
+  const flushOutbox = async () => {
+    await flushAnswerOutbox(examPackage.attemptId, async (entry) => {
       await api("/api/student/answers", {
         method: "POST",
         body: JSON.stringify({
           attemptId: examPackage.attemptId,
-          questionId,
-          selectedOptionIds,
-          idempotencyKey: createIdempotencyKey(),
-          changedAt: Date.now()
+          questionId: entry.questionId,
+          selectedOptionIds: entry.selectedOptionIds,
+          idempotencyKey: entry.idempotencyKey,
+          changedAt: entry.changedAt
         })
       });
-      setSaveState(navigator.onLine ? "saved" : "offline");
-    }).catch((e: unknown) => {
-      setSaveState("offline");
-      setError(e instanceof Error ? e.message : "Could not save this answer.");
-      throw e;
-    }).finally(() => {
-      if (savePromises.current.get(questionId) === pending) savePromises.current.delete(questionId);
     });
-    savePromises.current.set(questionId, pending);
-    await pending;
+    const count = await getPendingAnswerCount(examPackage.attemptId);
+    setPendingAnswerCount(count);
+    setSaveState(count ? "saving" : "saved");
+  };
+
+  const persistAnswer = (questionId: string, selectedOptionIds: string[]) => {
+    const previous = localWritePromises.current.get(questionId);
+    const pending = (previous?.catch(() => undefined) ?? Promise.resolve())
+      .then(() => saveAnswerLocally(examPackage.attemptId, questionId, selectedOptionIds, createIdempotencyKey()))
+      .then(async () => {
+        const count = await getPendingAnswerCount(examPackage.attemptId);
+        setPendingAnswerCount(count);
+        setSaveState(navigator.onLine ? "saving" : "offline");
+      })
+      .catch((error: unknown) => {
+        setSaveState("offline");
+        setError(error instanceof Error ? error.message : "Could not save this answer on this device.");
+        throw error;
+      })
+      .finally(() => {
+        if (localWritePromises.current.get(questionId) === pending) localWritePromises.current.delete(questionId);
+      });
+    localWritePromises.current.set(questionId, pending);
+    return pending;
   };
 
   const selectOption = (questionId: string, optionId: string) => {
+    if (isFrozen) return;
     const prior = answersRef.current[questionId] ?? [];
     const next = currentQuestion.type === "MULTI"
       ? prior.includes(optionId) ? prior.filter((id) => id !== optionId) : [...prior, optionId]
@@ -1114,9 +1259,13 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
     answersRef.current = updated;
     setAnswers(updated);
     setSaveState("saving");
+    void persistAnswer(questionId, next).catch(() => undefined);
     const existingTimeout = timeoutIds.current.get(questionId);
     if (existingTimeout) window.clearTimeout(existingTimeout);
-    timeoutIds.current.set(questionId, window.setTimeout(() => void saveAnswer(questionId, next).catch(() => undefined), 350));
+    timeoutIds.current.set(questionId, window.setTimeout(() => {
+      const pendingWrite = localWritePromises.current.get(questionId) ?? Promise.resolve();
+      void pendingWrite.then(() => flushOutbox()).catch(() => setSaveState("offline"));
+    }, 350));
   };
 
   const submit = async (automatic: boolean) => {
@@ -1127,17 +1276,21 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
     if (automatic) setPrompt(false);
     timeoutIds.current.forEach((timeout) => window.clearTimeout(timeout));
     try {
-      await Promise.all(Object.keys(answersRef.current).map((questionId) => {
-        const timeout = timeoutIds.current.get(questionId);
-        if (timeout) window.clearTimeout(timeout);
-        return saveAnswer(questionId, answersRef.current[questionId] ?? []);
-      }));
-      const graded = await api<{ score: number; maxScore: number; topicBreakdown: Array<{ topic: TopicRecord; correct: number; total: number; score: number }> }>(`/api/student/attempts/${examPackage.attemptId}/submit`, { method: "POST", body: "{}" });
+      await Promise.all([...localWritePromises.current.values()]);
+      const snapshot = frozenSubmissionRef.current ?? await freezeSubmission(examPackage.attemptId);
+      frozenSubmissionRef.current = snapshot;
+      setIsFrozen(true);
+      const graded = await api<{ score: number; maxScore: number; topicBreakdown: Array<{ topic: TopicRecord; correct: number; total: number; score: number }> }>(
+        `/api/student/attempts/${examPackage.attemptId}/submit`,
+        { method: "POST", body: JSON.stringify(snapshot) }
+      );
+      await removeCachedAttempt(examPackage.attemptId);
       setResult(graded);
       setSaveState("saved");
       if (document.fullscreenElement) await document.exitFullscreen().catch(() => undefined);
     } catch (e) {
       submittedRef.current = false;
+      setSaveState("offline");
       setError(e instanceof Error ? e.message : "Submission failed. Please retry.");
     } finally {
       setSubmitting(false);
@@ -1174,17 +1327,18 @@ function CBTPlayer({ examPackage, onExit }: { examPackage: ExamPackage; onExit: 
   </div>;
 
   return <div className="cbt-screen" onCopy={onClipboard} onCut={onClipboard} onPaste={onClipboard} onContextMenu={onContextMenu}>
-    {prompt && <div className="exam-prompt"><div className="card exam-prompt-card"><span className="eyebrow">READY TO BEGIN</span><h1>{examPackage.exam.title}</h1><p>This timed exam lasts {examPackage.exam.durationMinutes} minutes. Your deadline is set by the server. Answers are saved as you go.</p><p className="prompt-warning">Do not close this page. If your connection drops, notify the administrator before submitting.</p>{fullScreenWarning && <div className="notice notice-error">{fullScreenWarning}</div>}
+    {prompt && <div className="exam-prompt"><div className="card exam-prompt-card"><span className="eyebrow">READY TO BEGIN</span><h1>{examPackage.exam.title}</h1><p>This timed exam lasts {examPackage.exam.durationMinutes} minutes. Your deadline is set by the server. The exam and each answer are saved on this device.</p><p className="prompt-warning">If Wi-Fi drops, continue working. ChemArena will retry synchronization and submission when the server is reachable.</p>{fullScreenWarning && <div className="notice notice-error">{fullScreenWarning}</div>}
       <button className="button button-primary button-full" onClick={() => void startFullScreen()}>Enter full screen and begin</button><button className="button button-outline button-full" onClick={() => setPrompt(false)}>Continue without full screen</button></div></div>}
-    <header className="cbt-header"><div><span className="eyebrow">COMPUTER-BASED TEST</span><h1>{examPackage.exam.title}</h1></div><div className="cbt-header-right"><span className={`save-status save-${saveState}`}><i />{saveState === "saved" ? "Saved" : saveState === "saving" ? "Saving…" : "Offline — not synced"}</span><div className={`countdown ${remaining < 60_000 ? "countdown-urgent" : ""}`}><span>TIME LEFT</span><strong>{formatTime(remaining)}</strong></div></div></header>
+    <header className="cbt-header"><div><span className="eyebrow">COMPUTER-BASED TEST</span><h1>{examPackage.exam.title}</h1></div><div className="cbt-header-right"><span className={`save-status save-${saveState}`}><i />{saveState === "saved" ? "Saved" : saveState === "saving" ? `Saving${pendingAnswerCount ? ` (${pendingAnswerCount})` : ""}…` : "Offline — answers safe on this device"}</span><div className={`countdown ${remaining < 60_000 ? "countdown-urgent" : ""}`}><span>TIME LEFT</span><strong>{formatTime(remaining)}</strong></div></div></header>
+    {isFrozen && !result && <div className="notice notice-warning">Your final answers are frozen on this device. ChemArena will keep retrying until the server confirms your submission.</div>}
     {error && <div className="cbt-error"><ErrorNotice message={error} /><button className="button button-outline button-small" onClick={() => void submit(false)}>Retry submit</button></div>}
     {fullScreenWarning && <div className="notice notice-error">{fullScreenWarning}</div>}
     <div className="cbt-layout"><main className="cbt-question-area"><div className="cbt-question-top"><span>QUESTION {current + 1} <span className="muted">OF {examPackage.questions.length}</span></span><button className={`button button-small ${flags.includes(currentQuestion.id) ? "button-flag-active" : "button-outline"}`} onClick={() => toggleFlag(currentQuestion.id)}>{flags.includes(currentQuestion.id) ? "★ Flagged" : "☆ Flag for review"}</button></div>
       <article className="cbt-question"><h2>{currentQuestion.stem}</h2>{currentQuestion.smiles && <SmilesPreview smiles={currentQuestion.smiles} />}{currentQuestion.imageDataUrl && <img className="question-image" src={currentQuestion.imageDataUrl} alt="Question structure" />}
-        <div className="cbt-options">{currentQuestion.options.map((option, index) => <button key={option.id} className={`cbt-option ${(answers[currentQuestion.id] ?? []).includes(option.id) ? "cbt-option-selected" : ""}`} onClick={() => selectOption(currentQuestion.id, option.id)}><span className="cbt-option-letter">{String.fromCharCode(65 + index)}</span><span>{option.text}</span><i>{(answers[currentQuestion.id] ?? []).includes(option.id) ? "✓" : ""}</i></button>)}</div>
+        <div className="cbt-options">{currentQuestion.options.map((option, index) => <button key={option.id} disabled={isFrozen} className={`cbt-option ${(answers[currentQuestion.id] ?? []).includes(option.id) ? "cbt-option-selected" : ""}`} onClick={() => selectOption(currentQuestion.id, option.id)}><span className="cbt-option-letter">{String.fromCharCode(65 + index)}</span><span>{option.text}</span><i>{(answers[currentQuestion.id] ?? []).includes(option.id) ? "✓" : ""}</i></button>)}</div>
       </article>
-      <div className="cbt-navigation"><button className="button button-outline" disabled={current === 0} onClick={() => setCurrent((index) => index - 1)}>Previous</button><span>{Object.values(answers).filter((selected) => selected.length > 0).length} answered · {flags.length} flagged</span>{current < examPackage.questions.length - 1 ? <button className="button button-primary" onClick={() => setCurrent((index) => index + 1)}>Next question</button> : <button className="button button-primary" onClick={() => void submit(false)} disabled={submitting}>{submitting ? "Submitting…" : "Submit exam"}</button>}</div>
-    </main><aside className="cbt-navigator"><h2>Question navigator</h2><p>Select a question to jump to it.</p><div className="navigator-grid">{examPackage.questions.map((question, index) => <button key={question.id} onClick={() => setCurrent(index)} className={`${index === current ? "navigator-current" : ""} ${(answers[question.id] ?? []).length ? "navigator-answered" : ""} ${flags.includes(question.id) ? "navigator-flagged" : ""}`} aria-label={`Question ${index + 1}${(answers[question.id] ?? []).length ? ", answered" : ""}${flags.includes(question.id) ? ", flagged" : ""}`}>{index + 1}</button>)}</div><div className="navigator-legend"><span><i className="legend-answered" />Answered</span><span><i className="legend-flagged" />Flagged</span><span><i className="legend-current" />Current</span></div><button className="button button-danger button-full" onClick={() => { if (window.confirm("Submit your exam now?")) void submit(false); }} disabled={submitting}>Submit exam</button></aside></div>
+      <div className="cbt-navigation"><button className="button button-outline" disabled={current === 0} onClick={() => setCurrent((index) => index - 1)}>Previous</button><span>{Object.values(answers).filter((selected) => selected.length > 0).length} answered · {flags.length} flagged</span>{current < examPackage.questions.length - 1 ? <button className="button button-primary" onClick={() => setCurrent((index) => index + 1)}>Next question</button> : <button className="button button-primary" onClick={() => void submit(false)} disabled={submitting || isFrozen}>{submitting ? "Submitting…" : isFrozen ? "Waiting for connection…" : "Submit exam"}</button>}</div>
+    </main><aside className="cbt-navigator"><h2>Question navigator</h2><p>Select a question to jump to it.</p><div className="navigator-grid">{examPackage.questions.map((question, index) => <button key={question.id} onClick={() => setCurrent(index)} className={`${index === current ? "navigator-current" : ""} ${(answers[question.id] ?? []).length ? "navigator-answered" : ""} ${flags.includes(question.id) ? "navigator-flagged" : ""}`} aria-label={`Question ${index + 1}${(answers[question.id] ?? []).length ? ", answered" : ""}${flags.includes(question.id) ? ", flagged" : ""}`}>{index + 1}</button>)}</div><div className="navigator-legend"><span><i className="legend-answered" />Answered</span><span><i className="legend-flagged" />Flagged</span><span><i className="legend-current" />Current</span></div><button className="button button-danger button-full" onClick={() => { if (window.confirm("Submit your exam now?")) void submit(false); }} disabled={submitting || isFrozen}>Submit exam</button></aside></div>
     <footer className="cbt-footer">Switching tabs is recorded for exam integrity. Please stay on this page.</footer>
   </div>;
 }

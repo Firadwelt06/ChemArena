@@ -87,6 +87,20 @@ export const AnswerSubmissionSchema = z.object({
   }
 });
 
+export const FinalExamSubmissionSchema = z.object({
+  idempotencyKey: z.string().uuid(),
+  answers: z.record(z.string(), z.array(z.string().min(1)).max(8))
+}).superRefine(({ answers }, context) => {
+  if (Object.keys(answers).length > 200) {
+    context.addIssue({ code: "custom", message: "An exam submission cannot contain more than 200 answers.", path: ["answers"] });
+  }
+  for (const [questionId, selectedOptionIds] of Object.entries(answers)) {
+    if (!questionId || new Set(selectedOptionIds).size !== selectedOptionIds.length) {
+      context.addIssue({ code: "custom", message: "Answer question IDs and selected options must be unique and valid.", path: ["answers", questionId] });
+    }
+  }
+});
+
 export function isSameIdempotentPayload(existingHash: string, requestHash: string): boolean {
   return existingHash === requestHash;
 }
