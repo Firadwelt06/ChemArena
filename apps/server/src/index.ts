@@ -34,10 +34,19 @@ const submissionGraceSeconds = integerSetting("SUBMISSION_GRACE_SECONDS", 60, 0,
 const automaticBackupIntervalMinutes = integerSetting("AUTO_BACKUP_INTERVAL_MINUTES", 15, 1, 1_440);
 const openAiApiKey = process.env.OPENAI_API_KEY?.trim();
 const openAiModel = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
-// Provider preference list (comma-separated). Examples: "openai" or "openai,gemini"
-const aiProviders = (process.env.AI_PROVIDERS ?? "openai").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
-const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-1.5";
+const configuredGeminiModel = process.env.GEMINI_MODEL?.trim();
+const geminiModel = !configuredGeminiModel || configuredGeminiModel === "gemini-1.5"
+  ? "gemini-2.5-flash"
+  : configuredGeminiModel;
+const configuredAiProviders = process.env.AI_PROVIDERS?.split(",").map((provider) => provider.trim().toLowerCase()).filter(Boolean);
+const availableAiProviders = [
+  ...(geminiApiKey ? ["gemini"] : []),
+  ...(openAiApiKey ? ["openai"] : [])
+];
+const aiProviders = configuredAiProviders?.length
+  ? [...new Set([...configuredAiProviders, ...availableAiProviders])]
+  : availableAiProviders;
 let automaticBackupTimer: ReturnType<typeof setInterval> | undefined;
 let automaticBackupInProgress = false;
 let backupQueue: Promise<void> = Promise.resolve();
@@ -183,28 +192,40 @@ function duplicateQuestionWarnings(stem: string, existingStems: string[], batchS
 // requestGeminiJson: best-effort adapter for Google Gemini / Generative Language API
 async function requestGeminiJson(name: string, schema: object, instructions: string, input: string): Promise<unknown> {
   if (!geminiApiKey) throw new OpenAiProviderError("Gemini is not configured. Set GEMINI_API_KEY on the server, or use the paste-JSON workflow.");
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta2/models/${encodeURIComponent(geminiModel)}:generateText?key=${encodeURIComponent(geminiApiKey)}`;
-  const prompt = `${instructions}\n\n${input}\n\nReturn only valid JSON matching the requested schema.`;
+  const model = geminiModel.replace(/^models\//, "");
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(geminiApiKey)}`;
+  const prompt = `${instructions}\n\n${input}\n\nReturn only JSON matching this schema named "${name}":\n${JSON.stringify(schema)}`;
+  let response: Response;
   try {
-    const resp = await fetch(endpoint, {
+    response = await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ prompt, maxOutputTokens: 1600 }),
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseMimeType: "application/json" }
+      }),
       signal: AbortSignal.timeout(90_000)
     });
-    const body = await resp.json().catch(() => null);
-    if (!resp.ok) {
-      const message = body?.error?.message ?? `Gemini returned HTTP ${resp.status}`;
-      app.log.warn({ statusCode: resp.status, providerMessage: message }, "Gemini content generation request failed.");
-      throw new OpenAiProviderError(message);
-    }
-    const text = (body?.candidates?.[0]?.content) ?? (body?.candidates?.[0]?.output_text) ?? body?.outputText ?? body?.generatedText ?? null;
-    if (typeof text !== "string") throw new OpenAiProviderError("The AI service returned no structured content.");
-    try { return JSON.parse(text) as unknown; } catch { throw new OpenAiProviderError("The AI service returned malformed JSON."); }
   } catch (error) {
     const reason = error instanceof Error && error.name === "TimeoutError" ? "The AI request timed out." : "The AI service could not be reached.";
     app.log.warn({ err: error }, reason);
     throw new OpenAiProviderError(reason);
+  }
+  const body = await response.json().catch(() => null) as {
+    error?: { message?: string };
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+  } | null;
+  if (!response.ok) {
+    const message = body?.error?.message;
+    app.log.warn({ statusCode: response.status, providerMessage: message }, "Gemini content generation request failed.");
+    throw new OpenAiProviderError(message ? `Gemini rejected the request: ${message}` : `Gemini returned HTTP ${response.status}.`);
+  }
+  const text = body?.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("").trim();
+  if (!text) throw new OpenAiProviderError("Gemini returned no structured content.");
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new OpenAiProviderError("Gemini returned malformed JSON.");
   }
 }
 
@@ -731,7 +752,20 @@ app.get("/api/admin/coverage", { preHandler: requireAdmin }, async () => {
   return coverage;
 });
 
-app.get("/api/admin/ai/status", { preHandler: requireAdmin }, async () => ({ configured: Boolean(openAiApiKey), model: openAiModel }));
+app.get("/api/admin/ai/status", { preHandler: requireAdmin }, async () => {
+  const providers = aiProviders.flatMap((provider) => {
+    if (provider === "openai" && openAiApiKey) return [{ id: provider, model: openAiModel }];
+    if (provider === "gemini" && geminiApiKey) return [{ id: provider, model: geminiModel }];
+    return [];
+  });
+  const primary = providers[0];
+  return {
+    configured: providers.length > 0,
+    provider: primary?.id ?? null,
+    model: primary?.model ?? null,
+    providers
+  };
+});
 
 app.post("/api/admin/ai/lessons", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const parsed = LessonGenerationRequestSchema.safeParse(request.body);
@@ -739,7 +773,7 @@ app.post("/api/admin/ai/lessons", { preHandler: [requireCsrf, requireAdmin] }, a
   const topic = await prisma.topic.findUnique({ where: { id: parsed.data.topicId }, include: { parent: true } });
   if (!topic) return reply.code(404).send({ error: "Syllabus topic not found." });
   try {
-    const generated = await requestOpenAiJson(
+    const generated = await requestAiJson(
       "beginner_chemistry_lesson",
       lessonContentJsonSchema,
       "You write accurate, beginner-friendly organic chemistry lessons for SS1-SS3 students. Focus on the supplied syllabus topic. Give clear objectives, a structured markdown explanation with safe LaTeX math, worked examples, a low-cost safe classroom activity, exactly ten original four-option MCQ quiz items with one defensible correct answer and explanations, and homework. Avoid unsupported claims or unsafe chemical handling. Every quiz item must have a concise explanation. Return only the requested JSON.",
@@ -765,7 +799,7 @@ app.post("/api/admin/ai/questions", { preHandler: [requireCsrf, requireAdmin] },
   const topic = await prisma.topic.findUnique({ where: { id: parsed.data.topicId }, include: { parent: true } });
   if (!topic) return reply.code(404).send({ error: "Syllabus topic not found." });
   try {
-    const generated = await requestOpenAiJson(
+    const generated = await requestAiJson(
       "beginner_chemistry_questions",
       {
         type: "object",
@@ -1069,10 +1103,13 @@ app.post("/api/admin/questions/import", { preHandler: [requireCsrf, requireAdmin
 // Batch approve imported questions (fast path): accepts { ids: string[] } and marks those DRAFT -> APPROVED
 app.post("/api/admin/questions/batch-approve", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const body = request.body as { ids?: unknown };
-  if (!Array.isArray(body.ids) || body.ids.length === 0) return reply.code(400).send({ error: "Provide a non-empty array of question IDs." });
-  const ids = body.ids.map((id) => String(id));
+  if (!Array.isArray(body.ids) || body.ids.length === 0 || body.ids.length > 500
+    || body.ids.some((id) => typeof id !== "string" || !id.trim() || id.length > 128)) {
+    return reply.code(400).send({ error: "Provide between 1 and 500 valid question IDs." });
+  }
+  const ids = [...new Set(body.ids as string[])];
   const updated = await prisma.question.updateMany({ where: { id: { in: ids }, status: "DRAFT" }, data: { status: "APPROVED" } });
-  await audit(request.auth!.userId, "questions.batch_approved", "Question", undefined, { count: updated.count, ids });
+  await audit(request.auth!.userId, "questions.batch_approved", "Question", undefined, { count: updated.count });
   return reply.code(200).send({ approved: updated.count });
 });
 

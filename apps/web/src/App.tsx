@@ -428,7 +428,7 @@ function QuestionsPage() {
   const client = useQueryClient();
   const topics = useQuery({ queryKey: ["topics"], queryFn: () => api<TopicRecord[]>("/api/topics") });
   const questions = useQuery({ queryKey: ["questions"], queryFn: () => api<QuestionRecord[]>("/api/admin/questions") });
-  const aiStatus = useQuery({ queryKey: ["ai-status"], queryFn: () => api<{ configured: boolean; model: string }>("/api/admin/ai/status") });
+  const aiStatus = useQuery({ queryKey: ["ai-status"], queryFn: () => api<{ configured: boolean; provider: string | null; model: string | null; providers: Array<{ id: string; model: string }> }>("/api/admin/ai/status") });
   const [search, setSearch] = useState("");
   const [topicFilter, setTopicFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -443,12 +443,29 @@ function QuestionsPage() {
   const [generationCount, setGenerationCount] = useState(5);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<QuestionRecord | null>(null);
+  const [selectedDraftIds, setSelectedDraftIds] = useState<string[]>([]);
   const filtered = useMemo(() => questions.data?.filter((question) =>
     question.stem.toLowerCase().includes(search.toLowerCase())
       && (!topicFilter || question.topicId === topicFilter)
       && (!statusFilter || question.status === statusFilter)
       && (!difficultyFilter || question.difficulty === Number(difficultyFilter))
   ) ?? [], [questions.data, search, topicFilter, statusFilter, difficultyFilter]);
+  const visibleDrafts = filtered.filter((question) => question.status === "DRAFT");
+  const allVisibleDraftsSelected = visibleDrafts.length > 0 && visibleDrafts.every((question) => selectedDraftIds.includes(question.id));
+  const approveDrafts = useMutation({
+    mutationFn: (ids: string[]) => api<{ approved: number }>("/api/admin/questions/batch-approve", {
+      method: "POST",
+      body: JSON.stringify({ ids })
+    }),
+    onSuccess: async ({ approved }) => {
+      setSelectedDraftIds([]);
+      setImportMessage(`${approved} draft question${approved === 1 ? "" : "s"} approved.`);
+      setError("");
+      await client.invalidateQueries({ queryKey: ["questions"] });
+      await client.invalidateQueries({ queryKey: ["coverage"] });
+    },
+    onError: (cause: Error) => setError(cause.message)
+  });
   const download = () => {
     if (!questions.data) return;
     const payload = questions.data.map(({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status, source }) =>
@@ -613,7 +630,7 @@ function QuestionsPage() {
       <p className="batch-intro">Fill the spreadsheet template yourself, or use the prompt with an AI chat and paste its JSON response here. Imports are staged for review and created as Draft; nothing is automatically approved.</p>
       <div className="batch-actions"><button className="button button-outline" onClick={downloadQuestionTemplate}><Download size={16} />Download spreadsheet template</button><label className="button button-outline file-button"><FileUp size={16} />Review CSV / JSON file<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></label></div>
       <div className="lesson-generation card">
-        <div><strong>Generate questions with AI</strong><p>{aiStatus.data?.configured ? `Uses the server's ${aiStatus.data.model} API key. Generated items are staged as Draft for your review.` : "Optional OpenAI generation is not configured. Copy the prompt below and use the paste-JSON workflow."}</p></div>
+        <div><strong>Generate questions with AI</strong><p>{aiStatus.data?.configured ? `Uses ${aiStatus.data.providers.map(({ id, model }) => `${id} (${model})`).join(", ")} from the server. Generated items are staged as Draft for your review.` : "No supported AI provider is configured. Copy the prompt below and use the paste-JSON workflow."}</p></div>
         <label>Syllabus topic<select value={generationTopicId} onChange={(event) => setGenerationTopicId(event.target.value)}><option value="">Choose a topic</option>{topics.data?.filter((topic) => topic.parentId).map((topic) => <option key={topic.id} value={topic.id}>{topic.title}</option>)}</select></label>
         <label>Question count<input type="number" min={1} max={20} value={generationCount} onChange={(event) => setGenerationCount(Number(event.target.value))} /></label>
         <button className="button button-outline" disabled={!aiStatus.data?.configured || !generationTopicId || generateQuestions.isPending} onClick={() => generateQuestions.mutate()}>{generateQuestions.isPending ? "Generating…" : "Generate draft questions"}</button>
@@ -624,27 +641,8 @@ function QuestionsPage() {
       <div className="batch-actions"><button className="button button-primary" onClick={previewJson} disabled={!jsonText.trim()}>Validate and preview JSON</button></div>
       {importRows.length > 0 && <div className="import-review">
         <div className="table-title"><div><h3>Review import batch</h3><span className="muted">{importRows.filter((row) => row.question).length} valid · {importRows.filter((row) => row.issues.length).length} need fixes · {importRows.filter((row) => row.warnings.length).length} duplicate or review warnings</span></div>
-                  <div>
-                    <button className="button button-primary button-small" onClick={() => void importSelected()} disabled={!selectedImportRows.length}>Import {selectedImportRows.length} as Draft</button>
-                    <button className="button button-outline button-small" onClick={async () => {
-                      // Approve selected imported questions after they have been imported (server-side batch approve endpoint)
-                      try {
-                        if (!selectedImportRows.length) return;
-                        // Map selected rows to their eventual created IDs by importing them first if they are not yet in DB
-                        const toImport = importRows.filter((row) => row.question && selectedImportRows.includes(row.rowNumber)).map((r) => r.question!);
-                        const importResult = await api<{ imported: number }>("/api/admin/questions/import", { method: "POST", body: JSON.stringify({ questions: toImport }) });
-                        // Fetch recently created draft questions matching the stems to collect IDs
-                        const stems = toImport.map((q) => q.stem);
-                        const allDrafts = await api<QuestionRecord[]>(`/api/admin/questions?status=DRAFT`);
-                        const matched = allDrafts.filter((q) => stems.includes(q.stem)).map((q) => q.id);
-                        if (!matched.length) { alert("No imported drafts found to approve."); return; }
-                        const approveResp = await api<{ approved: number }>("/api/admin/questions/batch-approve", { method: "POST", body: JSON.stringify({ ids: matched }) });
-                        alert(`${approveResp.approved} question(s) approved.`);
-                        setImportRows([]); setSelectedImportRows([]); setJsonText(""); await client.invalidateQueries({ queryKey: ["questions"] });
-                      } catch (err) { alert(err instanceof Error ? err.message : String(err)); }
-                    }} disabled={!selectedImportRows.length} style={{ marginLeft: 8 }}>Import & Approve selected</button>
-                  </div>
-                </div>
+          <button className="button button-primary button-small" onClick={() => void importSelected()} disabled={!selectedImportRows.length}>Import {selectedImportRows.length} as Draft</button>
+        </div>
         <div className="import-rows">{importRows.map((row) => <label className={`import-row ${row.issues.length ? "import-row-invalid" : ""}`} key={row.rowNumber}>
           <input type="checkbox" checked={Boolean(row.question && selectedImportRows.includes(row.rowNumber))} disabled={!row.question} onChange={(event) => setSelectedImportRows((current) => event.target.checked ? [...current, row.rowNumber] : current.filter((number) => number !== row.rowNumber))} />
           <span className="import-row-index">#{row.rowNumber}</span>
@@ -656,7 +654,20 @@ function QuestionsPage() {
       </div>}
     </section>
     <section className="card filter-bar"><label className="grow">Search<input placeholder="Search question text…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><label>Topic<select value={topicFilter} onChange={(event) => setTopicFilter(event.target.value)}><option value="">All syllabus topics</option>{topics.data?.map((topic) => <option key={topic.id} value={topic.id}>{topic.parentId ? `— ${topic.title}` : topic.title}</option>)}</select></label><label>Status<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option><option value="DRAFT">Draft</option><option value="APPROVED">Approved</option></select></label><label>Difficulty<select value={difficultyFilter} onChange={(event) => setDifficultyFilter(event.target.value)}><option value="">All</option>{[1,2,3,4,5].map((level) => <option key={level} value={level}>{level}</option>)}</select></label></section>
-    <section className="question-list">{filtered.map((question, index) => <article className="card question-card" key={question.id}><div className="question-meta"><span className="question-number">{String(index + 1).padStart(2, "0")}</span><span className="topic-chip">{question.topic.title}</span><StatusPill status={question.status} /><span className="topic-chip">Source: {question.source ?? "manual"}</span><span className="difficulty">Level {question.difficulty}</span><button className="button button-outline button-small" onClick={() => { setEditing(question); setEditorOpen(true); }}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Delete this question? This cannot be undone.")) deleteQuestion.mutate(question); }}>Delete</button></div>
+    {visibleDrafts.length > 0 && <section className="card batch-approval">
+      <label className="check-row"><input type="checkbox" checked={allVisibleDraftsSelected} onChange={(event) => {
+        const visibleIds = visibleDrafts.map(({ id }) => id);
+        setSelectedDraftIds((current) => event.target.checked
+          ? [...new Set([...current, ...visibleIds])]
+          : current.filter((id) => !visibleIds.includes(id)));
+      }} /><span>Select all {visibleDrafts.length} visible draft{visibleDrafts.length === 1 ? "" : "s"}</span></label>
+      <button className="button button-primary button-small" disabled={!selectedDraftIds.length || approveDrafts.isPending} onClick={() => {
+        if (window.confirm(`Approve ${selectedDraftIds.length} selected draft question(s)? Only approve questions you have reviewed for accuracy and answer quality.`)) {
+          approveDrafts.mutate(selectedDraftIds);
+        }
+      }}>{approveDrafts.isPending ? "Approving…" : `Approve selected drafts (${selectedDraftIds.length})`}</button>
+    </section>}
+    <section className="question-list">{filtered.map((question, index) => <article className="card question-card" key={question.id}><div className="question-meta">{question.status === "DRAFT" && <label className="draft-select"><input type="checkbox" aria-label={`Select draft ${index + 1}`} checked={selectedDraftIds.includes(question.id)} onChange={(event) => setSelectedDraftIds((current) => event.target.checked ? [...new Set([...current, question.id])] : current.filter((id) => id !== question.id))} /></label>}<span className="question-number">{String(index + 1).padStart(2, "0")}</span><span className="topic-chip">{question.topic.title}</span><StatusPill status={question.status} /><span className="topic-chip">Source: {question.source ?? "manual"}</span><span className="difficulty">Level {question.difficulty}</span><button className="button button-outline button-small" onClick={() => { setEditing(question); setEditorOpen(true); }}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Delete this question? This cannot be undone.")) deleteQuestion.mutate(question); }}>Delete</button></div>
       <h3>{question.stem}</h3><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div>
       {question.smiles && <SmilesPreview smiles={question.smiles} />}
       {question.imageDataUrl && <img className="question-image question-list-image" src={question.imageDataUrl} alt="Question structure or image" />}

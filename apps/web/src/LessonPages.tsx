@@ -36,7 +36,12 @@ type StudentLesson = {
   content: LessonContent;
   completedAt: string | null;
 };
-type GenerationStatus = { configured: boolean; model: string };
+type GenerationStatus = {
+  configured: boolean;
+  provider: string | null;
+  model: string | null;
+  providers: Array<{ id: string; model: string }>;
+};
 
 function splitLines(text: string): string[] {
   return text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -204,7 +209,7 @@ function LessonEditor({ lesson, topics, classes, students, onCancel, onSave, bus
     {reviewWarnings.map((warning) => <div className="notice notice-warning" key={warning}>{warning}</div>)}
     <div className="editor-row"><label className="grow">Lesson title<input value={title} onChange={(event) => setTitle(event.target.value)} maxLength={180} required /></label><label>Syllabus topic<select value={topicId} onChange={(event) => setTopicId(event.target.value)} required><option value="">Choose a topic</option>{topics.map((topic) => <option key={topic.id} value={topic.id}>{topic.parentId ? "— " : ""}{topic.title}</option>)}</select></label></div>
     <div className="lesson-generation card">
-      <div><strong>AI lesson generator</strong><p>{aiStatus.data?.configured ? `Server-side ${aiStatus.data.model} is configured. Generated lessons always need teacher review.` : "Optional OpenAI integration is not configured. You can use the paste-JSON workflow below."}</p></div>
+      <div><strong>AI lesson generator</strong><p>{aiStatus.data?.configured ? `Server-side ${aiStatus.data.providers.map(({ id, model }) => `${id} (${model})`).join(", ")} configured. Generated lessons always need teacher review.` : "No supported AI provider is configured. You can use the paste-JSON workflow below."}</p></div>
       <button className="button button-outline" disabled={!aiStatus.data?.configured || !topicId || generate.isPending} onClick={() => generate.mutate()}>{generate.isPending ? "Generating lesson…" : "Generate from topic"}</button>
     </div>
     <section className="lesson-fields">
