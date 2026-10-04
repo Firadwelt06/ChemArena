@@ -45,6 +45,15 @@ describe("question batch import", () => {
     expect(rows[0]?.question?.status).toBe("DRAFT");
   });
 
+  it("preserves the AI source tag and adds explicit accuracy and SMILES review warnings", () => {
+    const rows = parseQuestionJson(JSON.stringify({ questions: [{ ...question(), source: "AI", smiles: "C(C" }] }), topics, true);
+    expect(rows[0]?.question?.source).toBe("AI");
+    expect(rows[0]?.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("accuracy"),
+      expect.stringContaining("unmatched opening parenthesis")
+    ]));
+  });
+
   it("reports an unresolved topic without dropping the rest of a batch", () => {
     const rows = parseQuestionJson(JSON.stringify({ questions: [
       question(),

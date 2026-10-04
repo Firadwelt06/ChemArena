@@ -9,7 +9,11 @@ import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import argon2 from "argon2";
 import { PrismaClient, Role, RecordStatus } from "@prisma/client";
-import { AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, FinalExamSubmissionSchema, hasRole, isSameIdempotentPayload, LoginSchema, QuestionSchema, scoreAnswer, StudentImportSchema, TopicInputSchema } from "@chemarena/shared";
+import {
+  AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, FinalExamSubmissionSchema, GeneratedQuestionBatchSchema,
+  hasRole, inspectSmiles, isSameIdempotentPayload, LessonContentSchema, LessonGenerationRequestSchema, LessonSaveSchema,
+  LoginSchema, QuestionGenerationRequestSchema, QuestionSchema, scoreAnswer, StudentImportSchema, TopicInputSchema
+} from "@chemarena/shared";
 
 const prisma = new PrismaClient();
 const app = Fastify({ logger: true, trustProxy: false, bodyLimit: 2_000_000 });
@@ -28,6 +32,8 @@ const sessionDurationMs = 12 * 60 * 60 * 1_000;
 const sessionCookie = "chemarena_session";
 const submissionGraceSeconds = integerSetting("SUBMISSION_GRACE_SECONDS", 60, 0, 300);
 const automaticBackupIntervalMinutes = integerSetting("AUTO_BACKUP_INTERVAL_MINUTES", 15, 1, 1_440);
+const openAiApiKey = process.env.OPENAI_API_KEY?.trim();
+const openAiModel = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
 let automaticBackupTimer: ReturnType<typeof setInterval> | undefined;
 let automaticBackupInProgress = false;
 let backupQueue: Promise<void> = Promise.resolve();
@@ -63,6 +69,110 @@ async function serializeFinalSubmission<T>(submit: () => Promise<T>): Promise<T>
 
 function backupName(kind: "manual" | "auto"): string {
   return `chemarena-${kind}-${new Date().toISOString().replaceAll(":", "-")}-${randomBytes(3).toString("hex")}.db`;
+}
+
+class OpenAiProviderError extends Error {}
+
+const generatedQuestionJsonSchema = {
+  type: "object",
+  properties: {
+    stem: { type: "string" },
+    type: { type: "string", enum: ["SINGLE", "MULTI", "TRUE_FALSE"] },
+    options: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { id: { type: "string" }, text: { type: "string" } },
+        required: ["id", "text"],
+        additionalProperties: false
+      }
+    },
+    correctOptionIds: { type: "array", items: { type: "string" } },
+    explanation: { type: "string" },
+    difficulty: { type: "integer" },
+    tags: { type: "array", items: { type: "string" } },
+    smiles: { type: ["string", "null"] }
+  },
+  required: ["stem", "type", "options", "correctOptionIds", "explanation", "difficulty", "tags", "smiles"],
+  additionalProperties: false
+} as const;
+
+const lessonContentJsonSchema = {
+  type: "object",
+  properties: {
+    objectives: { type: "array", items: { type: "string" } },
+    explanationMarkdown: { type: "string" },
+    workedExamples: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: { problem: { type: "string" }, solution: { type: "string" } },
+        required: ["problem", "solution"],
+        additionalProperties: false
+      }
+    },
+    handsOnActivity: { type: "string" },
+    quiz: {
+      type: "array",
+      items: generatedQuestionJsonSchema
+    },
+    homework: { type: "string" }
+  },
+  required: ["objectives", "explanationMarkdown", "workedExamples", "handsOnActivity", "quiz", "homework"],
+  additionalProperties: false
+} as const;
+
+async function requestOpenAiJson(
+  name: string,
+  schema: object,
+  instructions: string,
+  input: string
+): Promise<unknown> {
+  if (!openAiApiKey) throw new OpenAiProviderError("OpenAI is not configured. Set OPENAI_API_KEY on the server, or use the paste-JSON workflow.");
+  let response: Response;
+  try {
+    response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${openAiApiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: openAiModel,
+        messages: [{ role: "system", content: instructions }, { role: "user", content: input }],
+        response_format: { type: "json_schema", json_schema: { name, strict: true, schema } }
+      }),
+      signal: AbortSignal.timeout(90_000)
+    });
+  } catch (error) {
+    const reason = error instanceof Error && error.name === "TimeoutError" ? "The AI request timed out." : "The AI service could not be reached.";
+    app.log.warn({ err: error }, reason);
+    throw new OpenAiProviderError(reason);
+  }
+  const payload = await response.json().catch(() => null) as {
+    error?: { message?: string };
+    choices?: Array<{ message?: { content?: string | null } }>;
+  } | null;
+  if (!response.ok) {
+    const message = payload?.error?.message;
+    app.log.warn({ statusCode: response.status, providerMessage: message }, "OpenAI content generation request failed.");
+    throw new OpenAiProviderError(message ? `OpenAI rejected the request: ${message}` : `OpenAI returned HTTP ${response.status}.`);
+  }
+  const content = payload?.choices?.[0]?.message?.content;
+  if (typeof content !== "string") throw new OpenAiProviderError("The AI service returned no structured content.");
+  try {
+    return JSON.parse(content) as unknown;
+  } catch {
+    throw new OpenAiProviderError("The AI service returned malformed JSON.");
+  }
+}
+
+function duplicateQuestionWarnings(stem: string, existingStems: string[], batchStems: Set<string>): string[] {
+  const normalized = stem.normalize("NFKD").replace(/\p{Diacritic}/gu, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const warnings = ["Review chemistry accuracy and confirm there is only one defensible correct answer."];
+  if (existingStems.some((existing) => existing.normalize("NFKD").replace(/\p{Diacritic}/gu, "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() === normalized)
+    || batchStems.has(normalized)) {
+    warnings.push("Possible duplicate: this stem matches an existing question or another generated item.");
+  }
+  batchStems.add(normalized);
+  return warnings;
 }
 
 function createSqliteBackup(kind: "manual" | "auto"): Promise<string> {
@@ -551,11 +661,280 @@ app.get("/api/admin/coverage", { preHandler: requireAdmin }, async () => {
   const coverage = await Promise.all(topics.map(async (topic) => {
     const [questions, lessons] = await Promise.all([
       prisma.question.count({ where: { topicId: topic.id, status: "APPROVED" } }),
-      prisma.lesson.count({ where: { topicId: topic.id, status: "PUBLISHED" } })
+      prisma.lesson.count({ where: { topicId: topic.id, publishedVersion: { not: null }, status: { not: "ARCHIVED" } } })
     ]);
     return { ...topic, approvedQuestions: questions, publishedLessons: lessons };
   }));
   return coverage;
+});
+
+app.get("/api/admin/ai/status", { preHandler: requireAdmin }, async () => ({ configured: Boolean(openAiApiKey), model: openAiModel }));
+
+app.post("/api/admin/ai/lessons", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const parsed = LessonGenerationRequestSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid lesson generation request." });
+  const topic = await prisma.topic.findUnique({ where: { id: parsed.data.topicId }, include: { parent: true } });
+  if (!topic) return reply.code(404).send({ error: "Syllabus topic not found." });
+  try {
+    const generated = await requestOpenAiJson(
+      "beginner_chemistry_lesson",
+      lessonContentJsonSchema,
+      "You write accurate, beginner-friendly organic chemistry lessons for SS1-SS3 students. Focus on the supplied syllabus topic. Give clear objectives, a structured markdown explanation with safe LaTeX math, worked examples, a low-cost safe classroom activity, exactly ten original four-option MCQ quiz items with one defensible correct answer and explanations, and homework. Avoid unsupported claims or unsafe chemical handling. Every quiz item must have a concise explanation. Return only the requested JSON.",
+      `Create a complete lesson for the learning outcome "${topic.title}" under "${topic.parent?.title ?? topic.title}". Topic description: ${topic.description || "No additional description."}`
+    );
+    const validated = LessonContentSchema.safeParse(generated);
+    if (!validated.success) return reply.code(502).send({ error: "The AI response did not match the lesson format. Try again or use the paste-JSON editor.", details: validated.error.issues.slice(0, 8) });
+    return {
+      title: topic.title,
+      topicId: topic.id,
+      content: validated.data,
+      reviewWarnings: ["AI-generated content may contain errors. Review every explanation and quiz answer before publishing."]
+    };
+  } catch (error) {
+    if (error instanceof OpenAiProviderError) return reply.code(502).send({ error: error.message });
+    throw error;
+  }
+});
+
+app.post("/api/admin/ai/questions", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const parsed = QuestionGenerationRequestSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid question generation request." });
+  const topic = await prisma.topic.findUnique({ where: { id: parsed.data.topicId }, include: { parent: true } });
+  if (!topic) return reply.code(404).send({ error: "Syllabus topic not found." });
+  try {
+    const generated = await requestOpenAiJson(
+      "beginner_chemistry_questions",
+      {
+        type: "object",
+        properties: {
+          questions: { type: "array", items: generatedQuestionJsonSchema }
+        },
+        required: ["questions"],
+        additionalProperties: false
+      },
+      "You write accurate, original, beginner-friendly organic chemistry competition MCQs for SS1-SS3 students. Each single-answer question must have exactly one defensible correct answer and plausible but clearly incorrect distractors. Explain the answer, avoid ambiguous wording and near-duplicates, and do not invent syllabus topics. Return only the requested JSON.",
+      `Create exactly ${parsed.data.count} questions for "${topic.title}" under "${topic.parent?.title ?? topic.title}". Topic description: ${topic.description || "No additional description."} Return a mix of useful difficulty levels from 1 to 5.`
+    );
+    const validated = GeneratedQuestionBatchSchema.safeParse(generated);
+    if (!validated.success || validated.data.questions.length !== parsed.data.count) {
+      return reply.code(502).send({ error: "The AI response did not match the requested question format. Try again or use the paste-JSON workflow.", details: validated.success ? [] : validated.error.issues.slice(0, 8) });
+    }
+    const existingStems = (await prisma.question.findMany({ select: { stem: true } })).map(({ stem }) => stem);
+    const batchStems = new Set<string>();
+    const questions = validated.data.questions.map((item) => {
+      const question = QuestionSchema.parse({
+        ...item,
+        topicId: topic.id,
+        imageDataUrl: null,
+        status: "DRAFT",
+        source: "AI"
+      });
+      return {
+        question,
+        warnings: [
+          ...duplicateQuestionWarnings(question.stem, existingStems, batchStems),
+          ...inspectSmiles(question.smiles)
+        ]
+      };
+    });
+    return { questions };
+  } catch (error) {
+    if (error instanceof OpenAiProviderError) return reply.code(502).send({ error: error.message });
+    throw error;
+  }
+});
+
+app.get("/api/admin/lessons", { preHandler: requireAdmin }, async () => {
+  const lessons = await prisma.lesson.findMany({
+    include: {
+      topic: true,
+      versions: { orderBy: { version: "desc" }, take: 1 },
+      classAssignments: { include: { class: { select: { id: true, name: true } } } },
+      studentAssignments: { include: { user: { select: { id: true, displayName: true, username: true } } } }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+  return lessons.map((lesson) => ({
+    id: lesson.id,
+    title: lesson.title,
+    topicId: lesson.topicId,
+    topic: lesson.topic,
+    status: lesson.status,
+    currentVersion: lesson.currentVersion,
+    publishedVersion: lesson.publishedVersion,
+    content: lesson.versions[0] ? JSON.parse(lesson.versions[0].content) : null,
+    classAssignments: lesson.classAssignments.map(({ class: classRecord }) => classRecord),
+    studentAssignments: lesson.studentAssignments.map(({ user }) => user),
+    updatedAt: lesson.updatedAt
+  }));
+});
+
+app.post("/api/admin/lessons", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const parsed = LessonSaveSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid lesson." });
+  const data = parsed.data;
+  const topic = await prisma.topic.findUnique({ where: { id: data.topicId } });
+  if (!topic) return reply.code(400).send({ error: "Choose a valid syllabus topic." });
+  const [classes, students] = await Promise.all([
+    prisma.class.findMany({ where: { id: { in: data.classIds }, status: "ACTIVE" }, select: { id: true } }),
+    prisma.user.findMany({ where: { id: { in: data.studentIds }, role: Role.STUDENT, status: RecordStatus.ACTIVE }, select: { id: true } })
+  ]);
+  if (classes.length !== data.classIds.length || students.length !== data.studentIds.length) {
+    return reply.code(400).send({ error: "Assignments must reference active classes and students." });
+  }
+  const lesson = await prisma.lesson.create({
+    data: {
+      title: data.title,
+      topicId: data.topicId,
+      versions: { create: { version: 1, content: JSON.stringify(data.content) } },
+      classAssignments: { create: data.classIds.map((classId) => ({ classId })) },
+      studentAssignments: { create: data.studentIds.map((userId) => ({ userId })) }
+    }
+  });
+  await audit(request.auth!.userId, "lesson.created", "Lesson", lesson.id, { topicId: lesson.topicId });
+  return reply.code(201).send({ id: lesson.id, currentVersion: lesson.currentVersion, status: lesson.status });
+});
+
+app.put("/api/admin/lessons/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const parsed = LessonSaveSchema.safeParse(request.body);
+  if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid lesson." });
+  const data = parsed.data;
+  const [existing, topic, classes, students] = await Promise.all([
+    prisma.lesson.findUnique({ where: { id } }),
+    prisma.topic.findUnique({ where: { id: data.topicId } }),
+    prisma.class.findMany({ where: { id: { in: data.classIds }, status: "ACTIVE" }, select: { id: true } }),
+    prisma.user.findMany({ where: { id: { in: data.studentIds }, role: Role.STUDENT, status: RecordStatus.ACTIVE }, select: { id: true } })
+  ]);
+  if (!existing) return reply.code(404).send({ error: "Lesson not found." });
+  if (!topic) return reply.code(400).send({ error: "Choose a valid syllabus topic." });
+  if (existing.status === "ARCHIVED") return reply.code(409).send({ error: "Archived lessons cannot be edited." });
+  if (classes.length !== data.classIds.length || students.length !== data.studentIds.length) {
+    return reply.code(400).send({ error: "Assignments must reference active classes and students." });
+  }
+  const currentVersion = await prisma.lessonVersion.findUnique({
+    where: { lessonId_version: { lessonId: id, version: existing.currentVersion } }
+  });
+  const content = JSON.stringify(data.content);
+  const nextVersion = currentVersion?.content === content ? existing.currentVersion : existing.currentVersion + 1;
+  await prisma.$transaction(async (transaction) => {
+    if (nextVersion !== existing.currentVersion) {
+      await transaction.lessonVersion.create({ data: { lessonId: id, version: nextVersion, content } });
+    }
+    await transaction.lesson.update({
+      where: { id },
+      data: {
+        title: data.title,
+        topicId: data.topicId,
+        currentVersion: nextVersion,
+        classAssignments: {
+          deleteMany: {},
+          create: data.classIds.map((classId) => ({ classId }))
+        },
+        studentAssignments: {
+          deleteMany: {},
+          create: data.studentIds.map((userId) => ({ userId }))
+        }
+      }
+    });
+  });
+  await audit(request.auth!.userId, "lesson.updated", "Lesson", id, { topicId: data.topicId, version: nextVersion });
+  return { id, currentVersion: nextVersion };
+});
+
+app.post("/api/admin/lessons/:id/publish", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const lesson = await prisma.lesson.findUnique({ where: { id }, include: { classAssignments: true, studentAssignments: true } });
+  if (!lesson) return reply.code(404).send({ error: "Lesson not found." });
+  if (lesson.status === "ARCHIVED") return reply.code(409).send({ error: "Archived lessons cannot be published." });
+  if (!lesson.classAssignments.length && !lesson.studentAssignments.length) {
+    return reply.code(400).send({ error: "Assign the lesson to at least one class or student before publishing." });
+  }
+  await prisma.lesson.update({
+    where: { id },
+    data: { status: "PUBLISHED", publishedVersion: lesson.currentVersion }
+  });
+  await audit(request.auth!.userId, "lesson.published", "Lesson", id, { version: lesson.currentVersion });
+  return { id, status: "PUBLISHED", publishedVersion: lesson.currentVersion };
+});
+
+app.post("/api/admin/lessons/:id/archive", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const lesson = await prisma.lesson.update({ where: { id }, data: { status: "ARCHIVED" } });
+  await audit(request.auth!.userId, "lesson.archived", "Lesson", id);
+  return { id: lesson.id, status: lesson.status };
+});
+
+async function findPublishedLessonForStudent(lessonId: string, userId: string) {
+  const enrollments = await prisma.enrollment.findMany({ where: { userId }, select: { classId: true } });
+  return prisma.lesson.findFirst({
+    where: {
+      id: lessonId,
+      status: "PUBLISHED",
+      publishedVersion: { not: null },
+      OR: [
+        { classAssignments: { some: { classId: { in: enrollments.map(({ classId }) => classId) } } } },
+        { studentAssignments: { some: { userId } } }
+      ]
+    }
+  });
+}
+
+app.get("/api/student/lessons", { preHandler: requireStudent }, async (request: AuthenticatedRequest) => {
+  const enrollments = await prisma.enrollment.findMany({ where: { userId: request.auth!.userId }, select: { classId: true } });
+  const lessons = await prisma.lesson.findMany({
+    where: {
+      status: "PUBLISHED",
+      publishedVersion: { not: null },
+      OR: [
+        { classAssignments: { some: { classId: { in: enrollments.map(({ classId }) => classId) } } } },
+        { studentAssignments: { some: { userId: request.auth!.userId } } }
+      ]
+    },
+    include: {
+      topic: true,
+      progress: { where: { userId: request.auth!.userId }, select: { completedAt: true } }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+  return lessons.map((lesson) => ({
+    id: lesson.id,
+    title: lesson.title,
+    topic: lesson.topic,
+    version: lesson.publishedVersion,
+    completedAt: lesson.progress[0]?.completedAt ?? null
+  }));
+});
+
+app.get("/api/student/lessons/:id", { preHandler: requireStudent }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const lesson = await findPublishedLessonForStudent(id, request.auth!.userId);
+  if (!lesson || lesson.publishedVersion === null) return reply.code(404).send({ error: "Lesson not found." });
+  const [version, progress] = await Promise.all([
+    prisma.lessonVersion.findUnique({ where: { lessonId_version: { lessonId: id, version: lesson.publishedVersion } } }),
+    prisma.lessonProgress.findUnique({ where: { lessonId_userId: { lessonId: id, userId: request.auth!.userId } } })
+  ]);
+  if (!version) return reply.code(500).send({ error: "The published lesson version is missing." });
+  return {
+    id: lesson.id,
+    title: lesson.title,
+    topicId: lesson.topicId,
+    content: LessonContentSchema.parse(JSON.parse(version.content)),
+    version: version.version,
+    completedAt: progress?.completedAt ?? null
+  };
+});
+
+app.post("/api/student/lessons/:id/complete", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const lesson = await findPublishedLessonForStudent(id, request.auth!.userId);
+  if (!lesson) return reply.code(404).send({ error: "Lesson not found." });
+  const progress = await prisma.lessonProgress.upsert({
+    where: { lessonId_userId: { lessonId: id, userId: request.auth!.userId } },
+    create: { lessonId: id, userId: request.auth!.userId },
+    update: { completedAt: new Date() }
+  });
+  return { completedAt: progress.completedAt };
 });
 
 app.get("/api/admin/questions", { preHandler: requireAdmin }, async (request) => {
@@ -587,7 +966,7 @@ app.post("/api/admin/questions", { preHandler: [requireCsrf, requireAdmin] }, as
     data: {
       stem: q.stem, type: q.type, options: JSON.stringify(q.options), correctOptionIds: JSON.stringify(q.correctOptionIds),
       explanation: q.explanation, topicId: q.topicId, difficulty: q.difficulty, tags: JSON.stringify(q.tags),
-      smiles: q.smiles, imageDataUrl: q.imageDataUrl, status: q.status
+      smiles: q.smiles, imageDataUrl: q.imageDataUrl, status: q.status, source: q.source
     }
   });
   await audit(request.auth!.userId, "question.created", "Question", created.id, { status: q.status, topicId: q.topicId });
@@ -616,7 +995,8 @@ app.post("/api/admin/questions/import", { preHandler: [requireCsrf, requireAdmin
       tags: JSON.stringify(question.tags),
       smiles: question.smiles,
       imageDataUrl: question.imageDataUrl,
-      status: question.status
+      status: question.status,
+      source: question.source
     }
   })));
   await audit(request.auth!.userId, "questions.imported", "Question", undefined, { count: parsed.length });
@@ -649,7 +1029,7 @@ app.put("/api/admin/questions/:id", { preHandler: [requireCsrf, requireAdmin] },
     data: {
       stem: q.stem, type: q.type, options: JSON.stringify(q.options), correctOptionIds: JSON.stringify(q.correctOptionIds),
       explanation: q.explanation, topicId: q.topicId, difficulty: q.difficulty, tags: JSON.stringify(q.tags),
-      smiles: q.smiles, imageDataUrl: q.imageDataUrl, status: q.status
+      smiles: q.smiles, imageDataUrl: q.imageDataUrl, status: q.status, source: q.source
     }
   });
   await audit(request.auth!.userId, "question.updated", "Question", id, { status: q.status });

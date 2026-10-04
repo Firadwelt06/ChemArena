@@ -1,5 +1,5 @@
 import Papa from "papaparse";
-import { QuestionSchema, type QuestionInput } from "@chemarena/shared";
+import { inspectSmiles, QuestionSchema, type QuestionInput } from "@chemarena/shared";
 
 export type ImportTopic = {
   id: string;
@@ -63,6 +63,7 @@ function parseQuestionRecord(
     tags: record.tags ?? [],
     smiles: record.smiles ?? null,
     imageDataUrl: record.imageDataUrl ?? null,
+    source: record.source ?? "imported",
     status: shouldForceDraft ? "DRAFT" : (record.status ?? "DRAFT")
   };
   const parsed = QuestionSchema.safeParse(data);
@@ -77,7 +78,11 @@ function parseQuestionRecord(
     rowNumber: index + 1,
     question: parsed.data,
     issues: [],
-    warnings: shouldForceDraft && record.status === "APPROVED" ? ["Imported as Draft; AI-generated questions are never auto-approved."] : []
+    warnings: [
+      ...(shouldForceDraft && record.status === "APPROVED" ? ["Imported as Draft; AI-generated questions are never auto-approved."] : []),
+      ...(parsed.data.source === "AI" ? ["Review chemistry accuracy and confirm there is only one defensible correct answer."] : []),
+      ...inspectSmiles(parsed.data.smiles)
+    ]
   };
 }
 
@@ -193,5 +198,5 @@ export function createQuestionPrompt(topics: ImportTopic[]): string {
     const outcomes = topics.filter((topic) => topic.parentId === chapter.id).map((topic) => `  - ${topic.title}`);
     return `${chapter.title}\n${outcomes.join("\n")}`;
   }).join("\n");
-  return `Create a batch of 10 original, accurate, beginner-friendly organic chemistry multiple-choice questions for SS1-SS3 students. Use only the syllabus topics below. Vary difficulty from 1 to 5. Every question must have one clearly defensible correct answer, three plausible but unambiguously incorrect distractors, and a concise explanation. Avoid near-duplicates and trick wording. Do not invent syllabus topics. Return only valid JSON with this exact shape (no markdown):\n{"questions":[{"chapter":"exact chapter title","outcome":"exact learning outcome title","stem":"Question text","type":"SINGLE","options":[{"id":"a","text":"Option A"},{"id":"b","text":"Option B"},{"id":"c","text":"Option C"},{"id":"d","text":"Option D"}],"correctOptionIds":["a"],"explanation":"Why the answer is correct","difficulty":2,"tags":["topic tag"],"smiles":null}]}\nUse exact chapter and outcome wording from this syllabus. For multi-answer questions use type MULTI and list all correct option IDs. Use type TRUE_FALSE only with exactly two options. Questions will be imported as Draft for teacher review.\n\nSYLLABUS:\n${syllabus}`;
+  return `Create a batch of 10 original, accurate, beginner-friendly organic chemistry multiple-choice questions for SS1-SS3 students. Use only the syllabus topics below. Vary difficulty from 1 to 5. Every question must have one clearly defensible correct answer, three plausible but unambiguously incorrect distractors, and a concise explanation. Avoid near-duplicates and trick wording. Do not invent syllabus topics. Return only valid JSON with this exact shape (no markdown):\n{"questions":[{"chapter":"exact chapter title","outcome":"exact learning outcome","stem":"Question text","type":"SINGLE","options":[{"id":"a","text":"Option A"},{"id":"b","text":"Option B"},{"id":"c","text":"Option C"},{"id":"d","text":"Option D"}],"correctOptionIds":["a"],"explanation":"Why the answer is correct","difficulty":2,"tags":["topic tag"],"smiles":null,"source":"AI"}]}\nUse exact chapter and outcome wording from this syllabus. For multi-answer questions use type MULTI and list all correct option IDs. Use type TRUE_FALSE only with exactly two options. Questions will be imported as Draft for teacher review and should be checked for accuracy and defensible answers.\n\nSYLLABUS:\n${syllabus}`;
 }

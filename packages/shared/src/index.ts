@@ -57,7 +57,8 @@ export const QuestionSchema = z.object({
   tags: z.array(z.string().trim().min(1).max(40)).max(20),
   smiles: z.string().max(2_000).nullable(),
   imageDataUrl: z.string().max(1_000_000).nullable().default(null),
-  status: z.enum(["DRAFT", "APPROVED"])
+  status: z.enum(["DRAFT", "APPROVED"]),
+  source: z.enum(["manual", "imported", "AI"]).default("manual")
 }).superRefine((question, context) => {
   const optionIds = question.options.map((option) => option.id);
   if (new Set(optionIds).size !== optionIds.length) {
@@ -74,6 +75,114 @@ export const QuestionSchema = z.object({
   }
 });
 export type QuestionInput = z.infer<typeof QuestionSchema>;
+
+export const GeneratedQuestionSchema = z.object({
+  stem: z.string().trim().min(1).max(10_000),
+  type: z.enum(["SINGLE", "MULTI", "TRUE_FALSE"]),
+  options: z.array(QuestionOptionSchema).min(2).max(8),
+  correctOptionIds: z.array(z.string().min(1)).min(1).max(8),
+  explanation: z.string().max(10_000),
+  difficulty: z.number().int().min(1).max(5),
+  tags: z.array(z.string().trim().min(1).max(40)).max(20),
+  smiles: z.string().max(2_000).nullable()
+}).superRefine((question, context) => {
+  const optionIds = question.options.map(({ id }) => id);
+  if (new Set(optionIds).size !== optionIds.length) {
+    context.addIssue({ code: "custom", message: "Option IDs must be unique.", path: ["options"] });
+  }
+  if (question.correctOptionIds.some((id) => !optionIds.includes(id)) || new Set(question.correctOptionIds).size !== question.correctOptionIds.length) {
+    context.addIssue({ code: "custom", message: "Correct answers must reference distinct options.", path: ["correctOptionIds"] });
+  }
+  if (question.type !== "MULTI" && question.correctOptionIds.length !== 1) {
+    context.addIssue({ code: "custom", message: "This question type requires exactly one correct answer.", path: ["correctOptionIds"] });
+  }
+  if (question.type === "TRUE_FALSE" && question.options.length !== 2) {
+    context.addIssue({ code: "custom", message: "True/false questions require exactly two options.", path: ["options"] });
+  }
+});
+
+export const GeneratedQuestionBatchSchema = z.object({
+  questions: z.array(GeneratedQuestionSchema).min(1).max(20)
+});
+export type GeneratedQuestion = z.infer<typeof GeneratedQuestionSchema>;
+
+export const LessonQuizQuestionSchema = GeneratedQuestionSchema;
+
+export const LessonContentSchema = z.object({
+  objectives: z.array(z.string().trim().min(1).max(500)).min(1).max(10),
+  explanationMarkdown: z.string().trim().min(1).max(30_000),
+  workedExamples: z.array(z.object({
+    problem: z.string().trim().min(1).max(4_000),
+    solution: z.string().trim().min(1).max(8_000)
+  })).min(1).max(8),
+  handsOnActivity: z.string().trim().min(1).max(8_000),
+  quiz: z.array(LessonQuizQuestionSchema).length(10),
+  homework: z.string().trim().min(1).max(8_000)
+});
+export type LessonContent = z.infer<typeof LessonContentSchema>;
+
+export const LessonSaveSchema = z.object({
+  title: z.string().trim().min(1).max(180),
+  topicId: z.string().min(1),
+  content: LessonContentSchema,
+  classIds: z.array(z.string().min(1)).max(100),
+  studentIds: z.array(z.string().min(1)).max(500)
+}).superRefine((lesson, context) => {
+  if (new Set(lesson.classIds).size !== lesson.classIds.length) {
+    context.addIssue({ code: "custom", message: "Class assignments must be unique.", path: ["classIds"] });
+  }
+  if (new Set(lesson.studentIds).size !== lesson.studentIds.length) {
+    context.addIssue({ code: "custom", message: "Student assignments must be unique.", path: ["studentIds"] });
+  }
+});
+
+export const LessonGenerationRequestSchema = z.object({
+  topicId: z.string().min(1)
+});
+
+export const QuestionGenerationRequestSchema = z.object({
+  topicId: z.string().min(1),
+  count: z.number().int().min(1).max(20)
+});
+
+export function inspectSmiles(smiles: string | null): string[] {
+  if (!smiles) return [];
+  const warnings: string[] = [];
+  let parentheses = 0;
+  let brackets = 0;
+  const ringCounts = new Map<string, number>();
+  for (let index = 0; index < smiles.length; index += 1) {
+    const character = smiles[index]!;
+    if (character === "(") parentheses += 1;
+    if (character === ")" && --parentheses < 0) {
+      warnings.push("SMILES has an unmatched closing parenthesis.");
+      break;
+    }
+    if (character === "[") brackets += 1;
+    if (character === "]" && --brackets < 0) {
+      warnings.push("SMILES has an unmatched closing bracket.");
+      break;
+    }
+    if (brackets > 0) continue;
+    if (character === "%" && /^\d{2}/.test(smiles.slice(index + 1, index + 3))) {
+      const ring = smiles.slice(index + 1, index + 3);
+      ringCounts.set(ring, (ringCounts.get(ring) ?? 0) + 1);
+      index += 2;
+    } else if (/\d/.test(character)) {
+      ringCounts.set(character, (ringCounts.get(character) ?? 0) + 1);
+    } else if (!/[A-Za-z0-9()\[\]@+\-\\/=.#:*%]/.test(character)) {
+      warnings.push("SMILES contains an unexpected character.");
+      break;
+    }
+  }
+  if (parentheses > 0) warnings.push("SMILES has an unmatched opening parenthesis.");
+  if (brackets > 0) warnings.push("SMILES has an unmatched opening bracket.");
+  if ([...ringCounts.values()].some((count) => count !== 2)) warnings.push("SMILES ring labels should each occur exactly twice.");
+  if (!/(?:Cl|Br|[BCNOFPSI]|[bcnops]|\[[^\]]+\]|\*)/.test(smiles)) {
+    warnings.push("SMILES may not contain a recognizable atom.");
+  }
+  return [...new Set(warnings)];
+}
 
 export const AnswerSubmissionSchema = z.object({
   attemptId: z.string().min(1),

@@ -10,7 +10,7 @@ ChemArena is a LAN-first organic chemistry practice and CBT platform. A teacher'
 4. Open `http://localhost:4174` on the teacher laptop. The one-time admin password and seeded student login slips are printed in the server terminal during first-time setup. Save them and change the admin password after signing in.
 5. On the admin dashboard, share a listed LAN URL or its QR code. Students open it while connected to the same Wi-Fi/hotspot.
 
-The Linux/macOS launcher is [`start.sh`](./start.sh). Both launchers use the same default port, `4174`; edit `apps/server/.env` to change `PORT`, `HOST`, `SUBMISSION_GRACE_SECONDS` or `AUTO_BACKUP_INTERVAL_MINUTES`. The first launcher run creates that file from `apps/server/.env.example`.
+The Linux/macOS launcher is [`start.sh`](./start.sh). Both launchers use the same default port, `4174`; edit `apps/server/.env` to change `PORT`, `HOST`, `SUBMISSION_GRACE_SECONDS` or `AUTO_BACKUP_INTERVAL_MINUTES`. The first launcher run creates that file from `apps/server/.env.example`. Optional AI generation is configured using `OPENAI_API_KEY` and `OPENAI_MODEL` in this server-only file; keep the key private.
 
 ### npm install-script approval
 
@@ -129,6 +129,27 @@ Open **Question bank → Import a batch**:
 
 For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, `stem`, `type`, `options` as `{ "id": "a", "text": "..." }` objects, `correctOptionIds` as option IDs, `explanation`, `difficulty`, `tags`, and optional `smiles`. Chapter and outcome must match the Syllabus page. This import process flags exact normalized stem matches; it cannot determine whether two differently worded questions test the same idea or whether an answer is scientifically defensible, so teacher review remains essential. Legacy question CSV exports using internal `topicId` values and JSON-encoded option cells are still accepted.
 
+## Phase 3: lessons and AI assistance
+
+- **Lessons** is available to admins for Markdown lesson editing, syllabus tagging, class and individual-student assignment, version history, draft review and publishing. Editing a published lesson creates a newer version; students continue seeing the last published version until the admin publishes the update.
+- Students see only published lessons assigned to one of their classes or directly to them. Their completion marker is private to their account.
+- Lesson Markdown supports LaTeX (`$...$` / `$$...$$`) and lazily rendered SMILES diagrams in a fenced code block labelled `smiles`. HTML in Markdown is not enabled.
+- The lesson editor accepts validated JSON as well as manual editing. A lesson contains objectives, an explanation, worked examples, a hands-on activity, exactly ten quiz questions and homework.
+- The existing question-bank paste-JSON workflow remains available without an API key. Optional direct generation for lessons and question batches uses the OpenAI API from the server only. To enable it, put `OPENAI_API_KEY` in `apps/server/.env`; optionally change `OPENAI_MODEL` (default `gpt-4o-mini`). The server requires internet only while generating; generated content is stored in the local SQLite database and normal lessons, practice and exams do not need internet.
+- AI-generated questions are saved as **Draft** with source `AI`. Generation checks schema and basic SMILES syntax, and warns on exact duplicate stems. It cannot establish chemical truth or prove that an answer is the only defensible one. Review all content and answers yourself before publishing a lesson or approving a question; nothing generated is auto-published or auto-approved.
+- Chemistry structures can be included as SMILES text and are rendered for preview; the syntax check is intentionally lightweight and is not a chemistry validator.
+
+## Phase 3 manual test checklist
+
+1. As admin, create a lesson for a syllabus outcome, write Markdown using a LaTeX formula and a `smiles` code fence, and assign it to one class and one individual student.
+2. Save the lesson as a draft and confirm students cannot see it. Publish it, then sign in as a learner outside those assignments and confirm it remains hidden.
+3. Sign in as an assigned learner; open the lesson, reveal quiz answers, mark it complete, refresh, and confirm completion remains recorded.
+4. Edit a published lesson and save a new version. Confirm students still see the old published version until **Publish latest version** is selected.
+5. Paste malformed and valid lesson JSON to confirm validation; verify the quiz must contain exactly ten valid MCQs.
+6. Use the question-bank prompt/paste path without an OpenAI key. Confirm imported questions remain Draft and review warnings are visible.
+7. Optionally configure a server-side OpenAI key, generate a lesson and a small question batch, and verify the content is staged/stored locally, marked AI/Draft, and not automatically published or approved. Do not put the API key in browser code or share it.
+8. After these manual checks, Phase 3 is ready for review before beginning Phase 4 analytics.
+
 ## Data and security notes
 
 - The SQLite database is at `apps/server/prisma/chemarena.db`. Keep the laptop plugged in during exams and include that directory in normal system backups.
@@ -197,5 +218,4 @@ npm run db:seed
 
 ## Later phases
 
-- **Phase 3:** lesson authoring/progress and reviewed, locally stored AI-assisted lesson/question generation.
 - **Phase 4:** student/admin analytics, reports, weak-topic practice sets and expanded audit views.

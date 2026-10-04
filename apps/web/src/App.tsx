@@ -7,6 +7,7 @@ import {
   LayoutDashboard, LogOut, Menu, Plus, Printer, RefreshCw, Settings, ShieldCheck, Users, X
 } from "lucide-react";
 import { api, setCsrfToken, type Branding, type User } from "./api";
+import { AdminLessonsPage, StudentLessonsPage } from "./LessonPages";
 import {
   createQuestionPrompt,
   findDuplicateWarnings,
@@ -28,7 +29,7 @@ import {
   type ExamPackage
 } from "./examStore";
 
-type Page = "overview" | "classes" | "students" | "questions" | "syllabus" | "exams" | "settings";
+type Page = "overview" | "classes" | "students" | "questions" | "lessons" | "syllabus" | "exams" | "settings";
 type Dashboard = { studentCount: number; classCount: number; questionCount: number; activeExams: number; attempts: number };
 type ClassRecord = { id: string; name: string; status: "ACTIVE" | "INACTIVE"; _count: { enrollments: number } };
 type StudentRecord = {
@@ -52,6 +53,7 @@ type QuestionRecord = {
   smiles: string | null;
   imageDataUrl: string | null;
   status: string;
+  source?: string;
   topic: TopicRecord;
 };
 type LoginResult = { user: User; csrfToken: string };
@@ -212,6 +214,7 @@ const adminNavigation: Array<{ id: Page; label: string; icon: typeof LayoutDashb
   { id: "classes", label: "Classes", icon: GraduationCap },
   { id: "students", label: "Students", icon: Users },
   { id: "questions", label: "Question bank", icon: CircleHelp },
+  { id: "lessons", label: "Lessons", icon: BookOpen },
   { id: "syllabus", label: "Syllabus", icon: BookOpen },
   { id: "exams", label: "Exams", icon: Boxes },
   { id: "settings", label: "Settings", icon: Settings }
@@ -262,6 +265,7 @@ function AdminPage({ page, branding, onBrandingSaved }: { page: Page; branding: 
     case "classes": return <ClassesPage />;
     case "students": return <StudentsPage />;
     case "questions": return <QuestionsPage />;
+    case "lessons": return <AdminLessonsPage />;
     case "syllabus": return <SyllabusPage />;
     case "exams": return <ExamsPage />;
     case "settings": return <SettingsPage branding={branding} onSaved={onBrandingSaved} />;
@@ -424,6 +428,7 @@ function QuestionsPage() {
   const client = useQueryClient();
   const topics = useQuery({ queryKey: ["topics"], queryFn: () => api<TopicRecord[]>("/api/topics") });
   const questions = useQuery({ queryKey: ["questions"], queryFn: () => api<QuestionRecord[]>("/api/admin/questions") });
+  const aiStatus = useQuery({ queryKey: ["ai-status"], queryFn: () => api<{ configured: boolean; model: string }>("/api/admin/ai/status") });
   const [search, setSearch] = useState("");
   const [topicFilter, setTopicFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
@@ -434,6 +439,8 @@ function QuestionsPage() {
   const [importRows, setImportRows] = useState<QuestionImportRow[]>([]);
   const [selectedImportRows, setSelectedImportRows] = useState<number[]>([]);
   const [promptMessage, setPromptMessage] = useState("");
+  const [generationTopicId, setGenerationTopicId] = useState("");
+  const [generationCount, setGenerationCount] = useState(5);
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<QuestionRecord | null>(null);
   const filtered = useMemo(() => questions.data?.filter((question) =>
@@ -444,8 +451,8 @@ function QuestionsPage() {
   ) ?? [], [questions.data, search, topicFilter, statusFilter, difficultyFilter]);
   const download = () => {
     if (!questions.data) return;
-    const payload = questions.data.map(({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status }) =>
-      ({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status }));
+    const payload = questions.data.map(({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status, source }) =>
+      ({ stem, type, options, correctOptionIds, explanation, topicId, difficulty, tags, smiles, imageDataUrl, status, source }));
     const url = URL.createObjectURL(new Blob([JSON.stringify({ questions: payload }, null, 2)], { type: "application/json" }));
     const anchor = document.createElement("a"); anchor.href = url; anchor.download = "chemarena-questions.json"; anchor.click(); URL.revokeObjectURL(url);
   };
@@ -473,7 +480,8 @@ function QuestionsPage() {
         explanation: question.explanation,
         difficulty: question.difficulty,
         tags: question.tags.join(", "),
-        smiles: question.smiles ?? ""
+        smiles: question.smiles ?? "",
+        source: question.source ?? "manual"
       };
     });
     const url = URL.createObjectURL(new Blob([Papa.unparse(payload)], { type: "text/csv;charset=utf-8" }));
@@ -573,6 +581,23 @@ function QuestionsPage() {
       setPromptMessage("Clipboard access is unavailable. Open the prompt below and copy it manually.");
     }
   };
+  const generateQuestions = useMutation({
+    mutationFn: () => api<{ questions: Array<{ question: NonNullable<QuestionImportRow["question"]>; warnings: string[] }> }>("/api/admin/ai/questions", {
+      method: "POST",
+      body: JSON.stringify({ topicId: generationTopicId, count: generationCount })
+    }),
+    onSuccess: ({ questions: generated }) => {
+      stageImport(generated.map(({ question, warnings }, index) => ({
+        rowNumber: index + 1,
+        question,
+        issues: [],
+        warnings
+      })));
+      setPromptMessage(`${generated.length} AI question${generated.length === 1 ? "" : "s"} staged as Draft. Review every warning before importing.`);
+      setError("");
+    },
+    onError: (e: Error) => setError(e.message)
+  });
   const deleteQuestion = useMutation({
     mutationFn: (question: QuestionRecord) => api(`/api/admin/questions/${question.id}`, { method: "DELETE" }),
     onSuccess: () => void client.invalidateQueries({ queryKey: ["questions"] }),
@@ -587,6 +612,12 @@ function QuestionsPage() {
       <div className="table-title"><div><span className="eyebrow">BUILD YOUR BANK</span><h2>Import a batch</h2></div><button className="button button-outline button-small" onClick={() => void copyPrompt()}>Copy AI prompt</button></div>
       <p className="batch-intro">Fill the spreadsheet template yourself, or use the prompt with an AI chat and paste its JSON response here. Imports are staged for review and created as Draft; nothing is automatically approved.</p>
       <div className="batch-actions"><button className="button button-outline" onClick={downloadQuestionTemplate}><Download size={16} />Download spreadsheet template</button><label className="button button-outline file-button"><FileUp size={16} />Review CSV / JSON file<input type="file" accept=".json,.csv,application/json,text/csv" onChange={(event) => void importFile(event.target.files?.[0])} /></label></div>
+      <div className="lesson-generation card">
+        <div><strong>Generate questions with AI</strong><p>{aiStatus.data?.configured ? `Uses the server's ${aiStatus.data.model} API key. Generated items are staged as Draft for your review.` : "Optional OpenAI generation is not configured. Copy the prompt below and use the paste-JSON workflow."}</p></div>
+        <label>Syllabus topic<select value={generationTopicId} onChange={(event) => setGenerationTopicId(event.target.value)}><option value="">Choose a topic</option>{topics.data?.filter((topic) => topic.parentId).map((topic) => <option key={topic.id} value={topic.id}>{topic.title}</option>)}</select></label>
+        <label>Question count<input type="number" min={1} max={20} value={generationCount} onChange={(event) => setGenerationCount(Number(event.target.value))} /></label>
+        <button className="button button-outline" disabled={!aiStatus.data?.configured || !generationTopicId || generateQuestions.isPending} onClick={() => generateQuestions.mutate()}>{generateQuestions.isPending ? "Generating…" : "Generate draft questions"}</button>
+      </div>
       <details className="prompt-details"><summary>View AI prompt and exact JSON format</summary><textarea readOnly rows={10} value={createQuestionPrompt(topics.data ?? [])} /></details>
       {promptMessage && <p className="helper-text" role="status">{promptMessage}</p>}
       <label>Paste an AI-generated JSON batch<textarea className="json-paste" value={jsonText} onChange={(event) => setJsonText(event.target.value)} placeholder={'{"questions":[{"chapter":"exact chapter title","outcome":"exact learning outcome","stem":"...","type":"SINGLE","options":[{"id":"a","text":"..."},{"id":"b","text":"..."},{"id":"c","text":"..."},{"id":"d","text":"..."}],"correctOptionIds":["a"],"explanation":"...","difficulty":2,"tags":["..."],"smiles":null}]}'} rows={5} /></label>
@@ -606,7 +637,7 @@ function QuestionsPage() {
       </div>}
     </section>
     <section className="card filter-bar"><label className="grow">Search<input placeholder="Search question text…" value={search} onChange={(event) => setSearch(event.target.value)} /></label><label>Topic<select value={topicFilter} onChange={(event) => setTopicFilter(event.target.value)}><option value="">All syllabus topics</option>{topics.data?.map((topic) => <option key={topic.id} value={topic.id}>{topic.parentId ? `— ${topic.title}` : topic.title}</option>)}</select></label><label>Status<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">All statuses</option><option value="DRAFT">Draft</option><option value="APPROVED">Approved</option></select></label><label>Difficulty<select value={difficultyFilter} onChange={(event) => setDifficultyFilter(event.target.value)}><option value="">All</option>{[1,2,3,4,5].map((level) => <option key={level} value={level}>{level}</option>)}</select></label></section>
-    <section className="question-list">{filtered.map((question, index) => <article className="card question-card" key={question.id}><div className="question-meta"><span className="question-number">{String(index + 1).padStart(2, "0")}</span><span className="topic-chip">{question.topic.title}</span><StatusPill status={question.status} /><span className="difficulty">Level {question.difficulty}</span><button className="button button-outline button-small" onClick={() => { setEditing(question); setEditorOpen(true); }}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Delete this question? This cannot be undone.")) deleteQuestion.mutate(question); }}>Delete</button></div>
+    <section className="question-list">{filtered.map((question, index) => <article className="card question-card" key={question.id}><div className="question-meta"><span className="question-number">{String(index + 1).padStart(2, "0")}</span><span className="topic-chip">{question.topic.title}</span><StatusPill status={question.status} /><span className="topic-chip">Source: {question.source ?? "manual"}</span><span className="difficulty">Level {question.difficulty}</span><button className="button button-outline button-small" onClick={() => { setEditing(question); setEditorOpen(true); }}>Edit</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Delete this question? This cannot be undone.")) deleteQuestion.mutate(question); }}>Delete</button></div>
       <h3>{question.stem}</h3><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div>
       {question.smiles && <SmilesPreview smiles={question.smiles} />}
       {question.imageDataUrl && <img className="question-image question-list-image" src={question.imageDataUrl} alt="Question structure or image" />}
@@ -638,7 +669,8 @@ function QuestionEditor({ initial, topics, onCancel, onSaved }: {
       method: initial ? "PUT" : "POST",
       body: JSON.stringify({
         stem, type, options, correctOptionIds, explanation, topicId, difficulty,
-        tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean), smiles: smiles.trim() || null, imageDataUrl, status
+        tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean), smiles: smiles.trim() || null, imageDataUrl, status,
+        source: initial?.source ?? "manual"
       })
     }),
     onSuccess: onSaved,
@@ -1069,6 +1101,7 @@ function StudentPage({ user }: { user: User }) {
       {review.data.questions.map((question, index) => <article key={question.id} className="review-question"><strong>{index + 1}. {question.stem}</strong><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : question.selectedOptionIds.includes(option.id) ? "option-wrong" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div><p>{question.explanation}</p></article>)}
     </section>}
     {review.isError && <ErrorNotice message={(review.error as Error).message} />}
+    <StudentLessonsPage />
     <section className="card table-card"><div className="table-title"><h2>Available exams</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Duration</th><th>Availability</th><th>Action</th></tr></thead><tbody>
       {exams.data?.map((exam) => <tr key={exam.id}><td className="strong-cell">{exam.title}<small className="table-subtitle">{exam.description}</small></td><td>{exam.durationMinutes} min</td><td>{exam.opensAt ? new Date(exam.opensAt).toLocaleString() : "Open"}</td><td><button className="button button-primary button-small" disabled={start.isPending} onClick={() => start.mutate(exam.id)}>{start.isPending ? "Starting…" : "Start / resume"}</button></td></tr>)}
       {!exams.data?.length && <EmptyRow columns={4} text={exams.isLoading ? "Loading exams…" : "No exams are currently available."} />}
