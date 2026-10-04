@@ -34,6 +34,10 @@ const submissionGraceSeconds = integerSetting("SUBMISSION_GRACE_SECONDS", 60, 0,
 const automaticBackupIntervalMinutes = integerSetting("AUTO_BACKUP_INTERVAL_MINUTES", 15, 1, 1_440);
 const openAiApiKey = process.env.OPENAI_API_KEY?.trim();
 const openAiModel = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
+// Provider preference list (comma-separated). Examples: "openai" or "openai,gemini"
+const aiProviders = (process.env.AI_PROVIDERS ?? "openai").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
+const geminiModel = process.env.GEMINI_MODEL?.trim() || "gemini-1.5";
 let automaticBackupTimer: ReturnType<typeof setInterval> | undefined;
 let automaticBackupInProgress = false;
 let backupQueue: Promise<void> = Promise.resolve();
@@ -173,6 +177,65 @@ function duplicateQuestionWarnings(stem: string, existingStems: string[], batchS
   }
   batchStems.add(normalized);
   return warnings;
+}
+
+// --- Multi-provider AI helpers (OpenAI + Gemini) ---
+// requestGeminiJson: best-effort adapter for Google Gemini / Generative Language API
+async function requestGeminiJson(name: string, schema: object, instructions: string, input: string): Promise<unknown> {
+  if (!geminiApiKey) throw new OpenAiProviderError("Gemini is not configured. Set GEMINI_API_KEY on the server, or use the paste-JSON workflow.");
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta2/models/${encodeURIComponent(geminiModel)}:generateText?key=${encodeURIComponent(geminiApiKey)}`;
+  const prompt = `${instructions}\n\n${input}\n\nReturn only valid JSON matching the requested schema.`;
+  try {
+    const resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt, maxOutputTokens: 1600 }),
+      signal: AbortSignal.timeout(90_000)
+    });
+    const body = await resp.json().catch(() => null);
+    if (!resp.ok) {
+      const message = body?.error?.message ?? `Gemini returned HTTP ${resp.status}`;
+      app.log.warn({ statusCode: resp.status, providerMessage: message }, "Gemini content generation request failed.");
+      throw new OpenAiProviderError(message);
+    }
+    const text = (body?.candidates?.[0]?.content) ?? (body?.candidates?.[0]?.output_text) ?? body?.outputText ?? body?.generatedText ?? null;
+    if (typeof text !== "string") throw new OpenAiProviderError("The AI service returned no structured content.");
+    try { return JSON.parse(text) as unknown; } catch { throw new OpenAiProviderError("The AI service returned malformed JSON."); }
+  } catch (error) {
+    const reason = error instanceof Error && error.name === "TimeoutError" ? "The AI request timed out." : "The AI service could not be reached.";
+    app.log.warn({ err: error }, reason);
+    throw new OpenAiProviderError(reason);
+  }
+}
+
+// requestAiJson: try configured providers in order
+async function requestAiJson(name: string, schema: object, instructions: string, input: string): Promise<unknown> {
+  const errors: Array<{ provider: string; message: string }> = [];
+  for (const provider of aiProviders) {
+    try {
+      if (provider === "openai") {
+        const result = await requestOpenAiJson(name, schema, instructions, input);
+        return result;
+      }
+      if (provider === "gemini") {
+        const result = await requestGeminiJson(name, schema, instructions, input);
+        return result;
+      }
+      app.log.info({ provider }, "Unknown AI provider configured; skipping.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      errors.push({ provider, message: msg });
+      app.log.warn({ provider, err: msg }, "AI provider failed; trying next provider if any.");
+    }
+  }
+  if (errors.length) {
+    const last = errors.at(-1);
+    if (!last) {
+      throw new OpenAiProviderError("All AI providers failed, but no provider details were recorded.");
+    }
+    throw new OpenAiProviderError(`All AI providers failed. Last: ${last.provider}: ${last.message}`);
+  }
+  throw new OpenAiProviderError("No AI provider configured. Set AI_PROVIDERS and provider API keys in apps/server/.env.");
 }
 
 function createSqliteBackup(kind: "manual" | "auto"): Promise<string> {
@@ -1001,6 +1064,16 @@ app.post("/api/admin/questions/import", { preHandler: [requireCsrf, requireAdmin
   })));
   await audit(request.auth!.userId, "questions.imported", "Question", undefined, { count: parsed.length });
   return reply.code(201).send({ imported: parsed.length });
+});
+
+// Batch approve imported questions (fast path): accepts { ids: string[] } and marks those DRAFT -> APPROVED
+app.post("/api/admin/questions/batch-approve", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const body = request.body as { ids?: unknown };
+  if (!Array.isArray(body.ids) || body.ids.length === 0) return reply.code(400).send({ error: "Provide a non-empty array of question IDs." });
+  const ids = body.ids.map((id) => String(id));
+  const updated = await prisma.question.updateMany({ where: { id: { in: ids }, status: "DRAFT" }, data: { status: "APPROVED" } });
+  await audit(request.auth!.userId, "questions.batch_approved", "Question", undefined, { count: updated.count, ids });
+  return reply.code(200).send({ approved: updated.count });
 });
 
 app.delete("/api/admin/questions/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {

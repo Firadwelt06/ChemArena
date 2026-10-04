@@ -624,8 +624,27 @@ function QuestionsPage() {
       <div className="batch-actions"><button className="button button-primary" onClick={previewJson} disabled={!jsonText.trim()}>Validate and preview JSON</button></div>
       {importRows.length > 0 && <div className="import-review">
         <div className="table-title"><div><h3>Review import batch</h3><span className="muted">{importRows.filter((row) => row.question).length} valid · {importRows.filter((row) => row.issues.length).length} need fixes · {importRows.filter((row) => row.warnings.length).length} duplicate or review warnings</span></div>
-          <button className="button button-primary button-small" onClick={() => void importSelected()} disabled={!selectedImportRows.length}>Import {selectedImportRows.length} as Draft</button>
-        </div>
+                  <div>
+                    <button className="button button-primary button-small" onClick={() => void importSelected()} disabled={!selectedImportRows.length}>Import {selectedImportRows.length} as Draft</button>
+                    <button className="button button-outline button-small" onClick={async () => {
+                      // Approve selected imported questions after they have been imported (server-side batch approve endpoint)
+                      try {
+                        if (!selectedImportRows.length) return;
+                        // Map selected rows to their eventual created IDs by importing them first if they are not yet in DB
+                        const toImport = importRows.filter((row) => row.question && selectedImportRows.includes(row.rowNumber)).map((r) => r.question!);
+                        const importResult = await api<{ imported: number }>("/api/admin/questions/import", { method: "POST", body: JSON.stringify({ questions: toImport }) });
+                        // Fetch recently created draft questions matching the stems to collect IDs
+                        const stems = toImport.map((q) => q.stem);
+                        const allDrafts = await api<QuestionRecord[]>(`/api/admin/questions?status=DRAFT`);
+                        const matched = allDrafts.filter((q) => stems.includes(q.stem)).map((q) => q.id);
+                        if (!matched.length) { alert("No imported drafts found to approve."); return; }
+                        const approveResp = await api<{ approved: number }>("/api/admin/questions/batch-approve", { method: "POST", body: JSON.stringify({ ids: matched }) });
+                        alert(`${approveResp.approved} question(s) approved.`);
+                        setImportRows([]); setSelectedImportRows([]); setJsonText(""); await client.invalidateQueries({ queryKey: ["questions"] });
+                      } catch (err) { alert(err instanceof Error ? err.message : String(err)); }
+                    }} disabled={!selectedImportRows.length} style={{ marginLeft: 8 }}>Import & Approve selected</button>
+                  </div>
+                </div>
         <div className="import-rows">{importRows.map((row) => <label className={`import-row ${row.issues.length ? "import-row-invalid" : ""}`} key={row.rowNumber}>
           <input type="checkbox" checked={Boolean(row.question && selectedImportRows.includes(row.rowNumber))} disabled={!row.question} onChange={(event) => setSelectedImportRows((current) => event.target.checked ? [...current, row.rowNumber] : current.filter((number) => number !== row.rowNumber))} />
           <span className="import-row-index">#{row.rowNumber}</span>
