@@ -139,17 +139,6 @@ For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, 
 - AI-generated questions are saved as **Draft** with source `AI`. Generation checks schema and basic SMILES syntax, and warns on exact duplicate stems. It cannot establish chemical truth or prove that an answer is the only defensible one. Review all content and answers yourself before publishing a lesson or approving a question; nothing generated is auto-published or auto-approved.
 - Chemistry structures can be included as SMILES text and are rendered for preview; the syntax check is intentionally lightweight and is not a chemistry validator.
 
-## Phase 3 manual test checklist
-
-1. As admin, create a lesson for a syllabus outcome, write Markdown using a LaTeX formula and a `smiles` code fence, and assign it to one class and one individual student.
-2. Save the lesson as a draft and confirm students cannot see it. Publish it, then sign in as a learner outside those assignments and confirm it remains hidden.
-3. Sign in as an assigned learner; open the lesson, reveal quiz answers, mark it complete, refresh, and confirm completion remains recorded.
-4. Edit a published lesson and save a new version. Confirm students still see the old published version until **Publish latest version** is selected.
-5. Paste malformed and valid lesson JSON to confirm validation; verify the quiz must contain exactly ten valid MCQs.
-6. Use the question-bank prompt/paste path without an OpenAI key. Confirm imported questions remain Draft and review warnings are visible.
-7. Optionally configure a server-side OpenAI key, generate a lesson and a small question batch, and verify the content is staged/stored locally, marked AI/Draft, and not automatically published or approved. Do not put the API key in browser code or share it.
-8. After these manual checks, Phase 3 is ready for review before beginning Phase 4 analytics.
-
 ## Data and security notes
 
 - The SQLite database is at `apps/server/prisma/chemarena.db`. Keep the laptop plugged in during exams and include that directory in normal system backups.
@@ -215,6 +204,17 @@ npm run db:seed
 6. Restore a test backup. Confirm ChemArena restarts, requires sign-in again, and the database contents match the selected backup. Keep a separate backup of any data that must not be replaced.
 7. Open the join URL from a second device and use **Test connection** before an exam. Confirm a blocked firewall or client-isolated hotspot is diagnosed using the LAN troubleshooting steps above.
 8. On disposable data only, run the Playwright network-drop test and the 60-student load test. Review all reported failures and response-time percentiles.
+
+## Phase 3 manual test checklist
+
+1. As admin, create a lesson for a syllabus outcome, write Markdown using a LaTeX formula and a `smiles` code fence, and assign it to one class and one individual student.
+2. Save the lesson as a draft and confirm students cannot see it. Publish it, then sign in as a learner outside those assignments and confirm it remains hidden.
+3. Sign in as an assigned learner; open the lesson, reveal quiz answers, mark it complete, refresh, and confirm completion remains recorded.
+4. Edit a published lesson and save a new version. Confirm students still see the old published version until **Publish latest version** is selected.
+5. Paste malformed and valid lesson JSON to confirm validation; verify the quiz must contain exactly ten valid MCQs.
+6. Use the question-bank prompt/paste path without an OpenAI key. Confirm imported questions remain Draft and review warnings are visible.
+7. Optionally configure a server-side OpenAI key, generate a lesson and a small question batch, and verify the content is staged/stored locally, marked AI/Draft, and not automatically published or approved. Do not put the API key in browser code or share it.
+8. After these manual checks, Phase 3 is ready for review before beginning Phase 4 analytics.
 
 ## Later phases
 
