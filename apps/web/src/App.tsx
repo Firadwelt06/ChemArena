@@ -123,7 +123,7 @@ function App() {
   return (
     <Shell user={user} branding={branding} page={page} onPage={setPage} onLogout={() => void logout()}>
       {user.role === "ADMIN"
-        ? <AdminPage page={page} branding={branding} onBrandingSaved={(next) => queryClient.setQueryData(["branding"], next)} />
+        ? <AdminPage page={page} branding={branding} onNavigate={setPage} onBrandingSaved={(next) => queryClient.setQueryData(["branding"], next)} />
         : <StudentPage user={user} />}
     </Shell>
   );
@@ -260,8 +260,9 @@ function PageHeader({ eyebrow, title, description, action }: { eyebrow?: string;
   return <div className="page-header"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</div>;
 }
 
-function AdminPage({ page, branding, onBrandingSaved }: { page: Page; branding: Branding; onBrandingSaved: (branding: Branding) => void }) {
+function AdminPage({ page, branding, onNavigate, onBrandingSaved }: { page: Page; branding: Branding; onNavigate: (page: Page) => void; onBrandingSaved: (branding: Branding) => void }) {
   switch (page) {
+    case "overview": return <DashboardPage onNavigate={onNavigate} />;
     case "classes": return <ClassesPage />;
     case "students": return <StudentsPage />;
     case "questions": return <QuestionsPage />;
@@ -269,11 +270,11 @@ function AdminPage({ page, branding, onBrandingSaved }: { page: Page; branding: 
     case "syllabus": return <SyllabusPage />;
     case "exams": return <ExamsPage />;
     case "settings": return <SettingsPage branding={branding} onSaved={onBrandingSaved} />;
-    default: return <DashboardPage />;
+    default: return <DashboardPage onNavigate={onNavigate} />;
   }
 }
 
-function DashboardPage() {
+function DashboardPage({ onNavigate }: { onNavigate: (page: Page) => void }) {
   const stats = useQuery({ queryKey: ["dashboard"], queryFn: () => api<Dashboard>("/api/admin/dashboard") });
   const lan = useQuery({ queryKey: ["lan"], queryFn: () => api<{ addresses: string[]; port: number; joinUrls: string[] }>("/api/admin/lan") });
   const data = stats.data;
@@ -281,10 +282,10 @@ function DashboardPage() {
     <PageHeader eyebrow="CHEMARENA ADMIN" title="Good day, administrator" description="A quick view of your classes, content and exam activity." />
     {stats.error && <ErrorNotice message={(stats.error as Error).message} />}
     <div className="stats-grid">
-      <StatCard label="Active students" value={data?.studentCount ?? "—"} icon={Users} trend="Manage class access" />
-      <StatCard label="Classes" value={data?.classCount ?? "—"} icon={GraduationCap} trend="Organize your learners" />
-      <StatCard label="Approved questions" value={data?.questionCount ?? "—"} icon={CircleHelp} trend="Across the syllabus" />
-      <StatCard label="Active exam attempts" value={data?.attempts ?? "—"} icon={Activity} trend={`${data?.activeExams ?? 0} exams running`} />
+      <StatCard label="Active students" value={data?.studentCount ?? "—"} icon={Users} trend="Manage class access" destination="students" onNavigate={onNavigate} />
+      <StatCard label="Classes" value={data?.classCount ?? "—"} icon={GraduationCap} trend="Organize your learners" destination="classes" onNavigate={onNavigate} />
+      <StatCard label="Approved questions" value={data?.questionCount ?? "—"} icon={CircleHelp} trend="Across the syllabus" destination="questions" onNavigate={onNavigate} />
+      <StatCard label="Active exam attempts" value={data?.attempts ?? "—"} icon={Activity} trend={`${data?.activeExams ?? 0} exams running`} destination="exams" onNavigate={onNavigate} />
     </div>
     <section className="card join-card">
       <div className="join-icon"><Activity size={19} /></div><div className="join-copy"><span className="eyebrow">YOUR LOCAL CLASSROOM</span><h2>Student join address</h2><p>Students must be connected to the same Wi-Fi or hotspot.</p>
@@ -295,20 +296,24 @@ function DashboardPage() {
     </section>
     <section className="quick-actions"><div className="section-heading"><div><span className="eyebrow">GET STARTED</span><h2>Quick actions</h2></div></div>
       <div className="quick-grid">
-        <QuickAction icon={Users} title="Add students" text="Create accounts and assign a class." />
-        <QuickAction icon={CircleHelp} title="Build your question bank" text="Add and approve syllabus-aligned questions." />
-        <QuickAction icon={Boxes} title="Create a mock exam" text="Set duration, marks and question selection." />
+        <QuickAction icon={Users} title="Add students" text="Create accounts and assign a class." destination="students" onNavigate={onNavigate} />
+        <QuickAction icon={CircleHelp} title="Build your question bank" text="Add and approve syllabus-aligned questions." destination="questions" onNavigate={onNavigate} />
+        <QuickAction icon={Boxes} title="Create a mock exam" text="Set duration, marks and question selection." destination="exams" onNavigate={onNavigate} />
       </div>
     </section>
   </div>;
 }
 
-function StatCard({ label, value, icon: Icon, trend }: { label: string; value: ReactNode; icon: typeof Users; trend: string }) {
-  return <article className="card stat-card"><div className="stat-top"><span>{label}</span><i><Icon size={18} /></i></div><strong className="stat-value">{value}</strong><small>{trend}</small></article>;
+function StatCard({ label, value, icon: Icon, trend, destination, onNavigate }: { label: string; value: ReactNode; icon: typeof Users; trend: string; destination: Page; onNavigate: (page: Page) => void }) {
+  return <button type="button" className="card stat-card" onClick={() => onNavigate(destination)} aria-label={`Open ${destination} page`}>
+    <span className="stat-top"><span>{label}</span><i><Icon size={18} /></i></span><span className="stat-value">{value}</span><small>{trend} · View</small>
+  </button>;
 }
 
-function QuickAction({ icon: Icon, title, text }: { icon: typeof Users; title: string; text: string }) {
-  return <article className="card quick-action"><span className="quick-icon"><Icon size={19} /></span><div><strong>{title}</strong><p>{text}</p></div><ChevronRight className="quick-arrow" size={18} /></article>;
+function QuickAction({ icon: Icon, title, text, destination, onNavigate }: { icon: typeof Users; title: string; text: string; destination: Page; onNavigate: (page: Page) => void }) {
+  return <button type="button" className="card quick-action" onClick={() => onNavigate(destination)}>
+    <span className="quick-icon"><Icon size={19} /></span><span className="quick-action-copy"><strong>{title}</strong><p>{text}</p></span><ChevronRight className="quick-arrow" size={18} />
+  </button>;
 }
 
 function ClassesPage() {

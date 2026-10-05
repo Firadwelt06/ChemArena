@@ -100,7 +100,9 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -.02em; }
 .page-header > .button { align-self: end; }
 .stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
 .card { border: 1px solid #e7ebf0; border-radius: 10px; background: white; box-shadow: 0 2px 6px #18304a05; }
-.stat-card { min-height: 137px; padding: 17px; }
+.stat-card { width: 100%; min-height: 137px; display: block; padding: 17px; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.stat-card:hover, .quick-action:hover { border-color: #c7d7e5; box-shadow: 0 5px 15px #18304a12; }
+.stat-card:focus-visible, .quick-action:focus-visible { outline: 3px solid color-mix(in srgb, var(--brand-accent) 60%, white); outline-offset: 2px; }
 .stat-top { display: flex; align-items: center; justify-content: space-between; color: #6b788b; font-size: 11px; font-weight: 600; }
 .stat-top i { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 9px; color: var(--brand-primary); background: #edf3f9; }
 .stat-value { display: block; margin: 12px 0 4px; color: #172a42; font-size: 27px; letter-spacing: -.05em; }
@@ -113,7 +115,8 @@ h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -.02em; }
 .join-status { display: flex; align-items: center; gap: 8px; color: #608171; font-size: 10px; white-space: nowrap; }
 .quick-actions { display: grid; gap: 12px; }.section-heading { display: flex; justify-content: space-between; align-items: end; }.section-heading h2 { margin-top: 4px; }
 .quick-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 13px; }
-.quick-action { min-height: 98px; display: flex; align-items: center; gap: 12px; padding: 15px; }
+.quick-action { width: 100%; min-height: 98px; display: flex; align-items: center; gap: 12px; padding: 15px; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.quick-action-copy { min-width: 0; }
 .quick-icon { width: 36px; height: 36px; display: grid; flex: none; place-items: center; border-radius: 10px; color: var(--brand-primary); background: #edf3f9; }
 .quick-action strong { font-size: 11px; }.quick-action p { margin: 5px 0 0; color: #8994a2; font-size: 10px; line-height: 1.5; }
 .quick-arrow { margin-left: auto; color: #aab4c0; }

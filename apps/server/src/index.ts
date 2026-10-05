@@ -36,8 +36,9 @@ const openAiApiKey = process.env.OPENAI_API_KEY?.trim();
 const openAiModel = process.env.OPENAI_MODEL?.trim() || "gpt-4o-mini";
 const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
 const configuredGeminiModel = process.env.GEMINI_MODEL?.trim();
-const geminiModel = !configuredGeminiModel || configuredGeminiModel === "gemini-1.5"
-  ? "gemini-2.5-flash"
+const geminiModel = !configuredGeminiModel
+  || ["gemini-1.5", "gemini-2.5-flash", "gemini-2.5-flash-lite"].includes(configuredGeminiModel)
+  ? "gemini-flash-lite-latest"
   : configuredGeminiModel;
 const configuredAiProviders = process.env.AI_PROVIDERS?.split(",").map((provider) => provider.trim().toLowerCase()).filter(Boolean);
 const availableAiProviders = [
@@ -202,7 +203,7 @@ async function requestGeminiJson(name: string, schema: object, instructions: str
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: "application/json" }
+        generationConfig: { responseMimeType: "application/json", maxOutputTokens: 8192 }
       }),
       signal: AbortSignal.timeout(90_000)
     });
