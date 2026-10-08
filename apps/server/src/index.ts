@@ -386,6 +386,47 @@ async function audit(actorId: string, action: string, entityType: string, entity
   });
 }
 
+function captureQuestionSnapshot(question: {
+  stem: string;
+  options: string;
+  correctOptionIds: string;
+  explanation: string;
+  topic: { id: string; title: string; parentId: string | null };
+}): string {
+  return JSON.stringify({
+    stem: question.stem,
+    options: JSON.parse(question.options),
+    correctOptionIds: JSON.parse(question.correctOptionIds),
+    explanation: question.explanation,
+    topicId: question.topic.id,
+    topicTitle: question.topic.title,
+    topicParentId: question.topic.parentId
+  });
+}
+
+async function backfillHistoricalQuestionSnapshots(): Promise<void> {
+  const answers = await prisma.answer.findMany({
+    where: { questionSnapshot: null, attempt: { status: "GRADED" } }
+  });
+  const questions = await prisma.question.findMany({
+    where: { id: { in: [...new Set(answers.map((answer) => answer.questionId))] } },
+    include: { topic: { select: { id: true, title: true, parentId: true } } }
+  });
+  const questionById = new Map(questions.map((question) => [question.id, question]));
+  for (let offset = 0; offset < answers.length; offset += 100) {
+    const batch = answers.slice(offset, offset + 100);
+    const updates = batch.map((answer) => {
+      const question = questionById.get(answer.questionId);
+      if (!question) throw new Error(`Cannot preserve historical answer ${answer.id}: its question is missing.`);
+      return prisma.answer.update({
+        where: { id: answer.id },
+        data: { questionSnapshot: captureQuestionSnapshot(question) }
+      });
+    });
+    await prisma.$transaction(updates);
+  }
+}
+
 async function gradedSummary(attemptId: string) {
   const attempt = await prisma.examAttempt.findUnique({
     where: { id: attemptId },
@@ -398,22 +439,27 @@ async function gradedSummary(attemptId: string) {
     select: { id: true, topicId: true, correctOptionIds: true }
   });
   const questionMap = new Map(questions.map((question) => [question.id, question]));
-  const answerMap = new Map(attempt.answers.map((answer) => [answer.questionId, JSON.parse(answer.selectedOptionIds) as string[]]));
+  const answerMap = new Map(attempt.answers.map((answer) => [answer.questionId, answer]));
   const breakdown = new Map<string, { topicId: string; correct: number; total: number; score: number }>();
   for (const questionId of questionIds) {
     const question = questionMap.get(questionId);
     if (!question) continue;
+    const answer = answerMap.get(questionId);
+    const snapshot = answer?.questionSnapshot
+      ? JSON.parse(answer.questionSnapshot) as { correctOptionIds: string[]; topicId: string }
+      : null;
     const earned = scoreAnswer(
-      JSON.parse(question.correctOptionIds) as string[],
-      answerMap.get(questionId) ?? [],
+      snapshot?.correctOptionIds ?? JSON.parse(question.correctOptionIds) as string[],
+      answer ? JSON.parse(answer.selectedOptionIds) as string[] : [],
       attempt.exam.marksPerQuestion,
       attempt.exam.negativeMarking ? attempt.exam.negativeMarks : 0
     );
-    const topicScore = breakdown.get(question.topicId) ?? { topicId: question.topicId, correct: 0, total: 0, score: 0 };
+    const topicId = snapshot?.topicId ?? question.topicId;
+    const topicScore = breakdown.get(topicId) ?? { topicId, correct: 0, total: 0, score: 0 };
     topicScore.total += 1;
     topicScore.score += earned;
     if (earned > 0) topicScore.correct += 1;
-    breakdown.set(question.topicId, topicScore);
+    breakdown.set(topicId, topicScore);
   }
   const topics = await prisma.topic.findMany({
     where: { id: { in: [...breakdown.keys()] } },
@@ -555,10 +601,151 @@ app.get("/api/admin/dashboard", { preHandler: requireAdmin }, async () => {
     prisma.user.count({ where: { role: Role.STUDENT, status: RecordStatus.ACTIVE } }),
     prisma.class.count({ where: { status: RecordStatus.ACTIVE } }),
     prisma.question.count({ where: { status: "APPROVED" } }),
-    prisma.exam.count({ where: { status: "ACTIVE" } }),
-    prisma.examAttempt.count({ where: { status: "IN_PROGRESS" } })
+    prisma.exam.count({ where: { status: "ACTIVE", isPractice: false } }),
+    prisma.examAttempt.count({ where: { status: "IN_PROGRESS", exam: { isPractice: false } } })
   ]);
   return { studentCount, classCount, questionCount, activeExams, attempts };
+});
+
+app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
+  const [attempts, auditLog] = await Promise.all([
+    prisma.examAttempt.findMany({
+      where: { status: "GRADED", exam: { isPractice: false } },
+      include: {
+        exam: { select: { marksPerQuestion: true } },
+        user: { select: { id: true, username: true, displayName: true, enrollments: { select: { class: { select: { id: true, name: true } } } } } },
+        answers: true
+      },
+      orderBy: { submittedAt: "desc" }
+    }),
+    prisma.auditLog.findMany({
+      include: { actor: { select: { username: true, displayName: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 100
+    })
+  ]);
+  const questionIds = [...new Set(attempts.flatMap((attempt) => JSON.parse(attempt.questionOrder) as string[]))];
+  const questions = await prisma.question.findMany({
+    where: { id: { in: questionIds } },
+    select: { id: true, stem: true, correctOptionIds: true, topic: { select: { id: true, title: true } }, options: true }
+  });
+  const questionById = new Map(questions.map((question) => [question.id, question]));
+  const leaderboard = new Map<string, {
+    id: string;
+    username: string;
+    displayName: string;
+    attempts: number;
+    totalPercent: number;
+    classes: Map<string, string>;
+    latestSubmittedAt: Date | null;
+  }>();
+  const heatmap = new Map<string, {
+    classId: string;
+    className: string;
+    topicId: string;
+    topicTitle: string;
+    correct: number;
+    total: number;
+  }>();
+  const itemAnalysis = new Map<string, {
+    questionId: string;
+    stem: string;
+    topicTitle: string;
+    attempts: number;
+    correct: number;
+    options: Map<string, number>;
+    optionLabels: Record<string, string>;
+  }>();
+  for (const attempt of attempts) {
+    const questionOrder = JSON.parse(attempt.questionOrder) as string[];
+    const denominator = questionOrder.length * attempt.exam.marksPerQuestion;
+    const percent = denominator > 0 ? Math.max(0, Math.min(100, ((attempt.score ?? 0) / denominator) * 100)) : 0;
+    const student = leaderboard.get(attempt.user.id) ?? {
+      id: attempt.user.id,
+      username: attempt.user.username,
+      displayName: attempt.user.displayName,
+      attempts: 0,
+      totalPercent: 0,
+      classes: new Map<string, string>(),
+      latestSubmittedAt: attempt.submittedAt
+    };
+    student.attempts += 1;
+    student.totalPercent += percent;
+    attempt.user.enrollments.forEach(({ class: record }) => student.classes.set(record.id, record.name));
+    leaderboard.set(attempt.user.id, student);
+    const answers = new Map(attempt.answers.map((answer) => [answer.questionId, answer]));
+    for (const questionId of questionOrder) {
+      const question = questionById.get(questionId);
+      if (!question) continue;
+      const answer = answers.get(questionId);
+      const selected = answer ? JSON.parse(answer.selectedOptionIds) as string[] : [];
+      const snapshot = answer?.questionSnapshot ? JSON.parse(answer.questionSnapshot) as {
+        stem: string;
+        options: Array<{ id: string; text: string }>;
+        correctOptionIds: string[];
+        topicId: string;
+        topicTitle: string;
+      } : null;
+      const correctIds = snapshot?.correctOptionIds ?? JSON.parse(question.correctOptionIds) as string[];
+      const topicId = snapshot?.topicId ?? question.topic.id;
+      const topicTitle = snapshot?.topicTitle ?? question.topic.title;
+      const isCorrect = selected.length === correctIds.length && correctIds.every((id) => selected.includes(id));
+      const item = itemAnalysis.get(questionId) ?? {
+        questionId,
+        stem: snapshot?.stem ?? question.stem,
+        topicTitle,
+        attempts: 0,
+        correct: 0,
+        options: new Map<string, number>(),
+        optionLabels: Object.fromEntries((snapshot?.options ?? JSON.parse(question.options) as Array<{ id: string; text: string }>).map((option) => [option.id, option.text]))
+      };
+      item.attempts += 1;
+      if (isCorrect) item.correct += 1;
+      selected.forEach((optionId) => item.options.set(optionId, (item.options.get(optionId) ?? 0) + 1));
+      itemAnalysis.set(questionId, item);
+      for (const enrollment of attempt.user.enrollments) {
+        const record = enrollment.class;
+        const key = `${record.id}:${topicId}`;
+        const cell = heatmap.get(key) ?? {
+          classId: record.id,
+          className: record.name,
+          topicId,
+          topicTitle,
+          correct: 0,
+          total: 0
+        };
+        cell.total += 1;
+        if (isCorrect) cell.correct += 1;
+        heatmap.set(key, cell);
+      }
+    }
+  }
+  return {
+    leaderboard: [...leaderboard.values()]
+      .map(({ totalPercent, classes, ...student }) => ({
+        ...student,
+        averagePercent: student.attempts ? Math.round(totalPercent / student.attempts) : 0,
+        classes: [...classes.values()].sort()
+      }))
+      .sort((left, right) => right.averagePercent - left.averagePercent || left.displayName.localeCompare(right.displayName)),
+    heatmap: [...heatmap.values()].map((cell) => ({ ...cell, accuracy: Math.round((cell.correct / cell.total) * 100) })),
+    itemAnalysis: [...itemAnalysis.values()]
+      .map(({ options, ...item }) => ({
+        ...item,
+        accuracy: Math.round((item.correct / item.attempts) * 100),
+        optionSelections: Object.fromEntries(options)
+      }))
+      .sort((left, right) => right.attempts - left.attempts),
+    auditLog: auditLog.map((event) => ({
+      id: event.id,
+      action: event.action,
+      entityType: event.entityType,
+      entityId: event.entityId,
+      details: event.details,
+      createdAt: event.createdAt,
+      actor: event.actor
+    }))
+  };
 });
 
 app.get("/api/admin/classes", { preHandler: requireAdmin }, async () =>
@@ -1134,6 +1321,42 @@ app.post("/api/admin/questions/batch-approve", { preHandler: [requireCsrf, requi
   return reply.code(200).send({ approved: updated.count });
 });
 
+app.get("/api/admin/question-issues", { preHandler: requireAdmin }, async (request) => {
+  const query = request.query as { status?: string };
+  return prisma.questionIssue.findMany({
+    where: query.status === "OPEN" || query.status === "RESOLVED" || query.status === "DISMISSED"
+      ? { status: query.status }
+      : {},
+    include: {
+      user: { select: { id: true, username: true, displayName: true } },
+      attempt: { select: { exam: { select: { title: true } }, attemptNumber: true } },
+      question: { select: { id: true, stem: true, topic: { select: { id: true, title: true } } } }
+    },
+    orderBy: [{ status: "asc" }, { updatedAt: "desc" }],
+    take: 500
+  });
+});
+
+app.patch("/api/admin/question-issues/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  if (!request.body || typeof request.body !== "object" || Array.isArray(request.body)) {
+    return reply.code(400).send({ error: "Provide a valid report update." });
+  }
+  const body = request.body as { status?: unknown; adminNote?: unknown };
+  if (body.status !== "OPEN" && body.status !== "RESOLVED" && body.status !== "DISMISSED") {
+    return reply.code(400).send({ error: "Choose OPEN, RESOLVED or DISMISSED." });
+  }
+  if (body.adminNote !== undefined && (typeof body.adminNote !== "string" || body.adminNote.length > 1000)) {
+    return reply.code(400).send({ error: "Admin notes must be at most 1000 characters." });
+  }
+  const issue = await prisma.questionIssue.update({
+    where: { id },
+    data: { status: body.status, ...(body.adminNote !== undefined ? { adminNote: body.adminNote.trim() } : {}) }
+  });
+  await audit(request.auth!.userId, "question_issue.status_changed", "QuestionIssue", id, { status: issue.status });
+  return issue;
+});
+
 app.delete("/api/admin/questions/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const { id } = request.params as { id: string };
   const usedByAttempt = await prisma.examItem.count({
@@ -1150,10 +1373,28 @@ app.delete("/api/admin/questions/:id", { preHandler: [requireCsrf, requireAdmin]
   return reply.code(204).send();
 });
 
+app.get("/api/admin/questions/:id", { preHandler: requireAdmin }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const question = await prisma.question.findUnique({ where: { id }, include: { topic: true } });
+  if (!question) return reply.code(404).send({ error: "Question not found." });
+  return {
+    ...question,
+    options: JSON.parse(question.options),
+    correctOptionIds: JSON.parse(question.correctOptionIds),
+    tags: JSON.parse(question.tags)
+  };
+});
+
 app.put("/api/admin/questions/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const { id } = request.params as { id: string };
   const parsed = QuestionSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid question." });
+  const activeExamUse = await prisma.examItem.count({
+    where: { questionId: id, exam: { attempts: { some: { status: { in: ["IN_PROGRESS", "SUBMITTED"] } } } } }
+  });
+  if (activeExamUse) {
+    return reply.code(409).send({ error: "This question is in an active exam. Wait for its attempts to finish before editing it so grading stays consistent." });
+  }
   const q = parsed.data;
   const updated = await prisma.question.update({
     where: { id },
@@ -1206,6 +1447,7 @@ app.post("/api/admin/exams", { preHandler: [requireCsrf, requireAdmin] }, async 
 
 app.get("/api/admin/exams", { preHandler: requireAdmin }, async () =>
   prisma.exam.findMany({
+    where: { isPractice: false },
     orderBy: { createdAt: "desc" },
     include: {
       classes: { include: { class: { select: { id: true, name: true } } } },
@@ -1663,6 +1905,51 @@ app.post("/api/student/attempts/:id/events", { preHandler: [requireCsrf, require
   return { ok: true };
 });
 
+app.post("/api/student/attempts/:id/question-issues", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
+  const { id: attemptId } = request.params as { id: string };
+  if (!request.body || typeof request.body !== "object" || Array.isArray(request.body)) {
+    return reply.code(400).send({ error: "Provide a valid question report." });
+  }
+  const body = request.body as { questionId?: unknown; category?: unknown; note?: unknown };
+  if (typeof body.questionId !== "string" || !body.questionId.trim() || body.questionId.length > 128) {
+    return reply.code(400).send({ error: "Choose a question to report." });
+  }
+  if (body.category !== "AMBIGUOUS" && body.category !== "INCORRECT" && body.category !== "TYPO" && body.category !== "OTHER") {
+    return reply.code(400).send({ error: "Choose a valid report category." });
+  }
+  if (body.note !== undefined && (typeof body.note !== "string" || body.note.length > 1000)) {
+    return reply.code(400).send({ error: "Report notes must be at most 1000 characters." });
+  }
+  const attempt = await prisma.examAttempt.findFirst({
+    where: { id: attemptId, userId: request.auth!.userId },
+    select: { questionOrder: true, status: true }
+  });
+  if (!attempt || attempt.status === "VOID") return reply.code(404).send({ error: "Attempt not found." });
+  if (!(JSON.parse(attempt.questionOrder) as string[]).includes(body.questionId)) {
+    return reply.code(400).send({ error: "That question is not part of this attempt." });
+  }
+  const question = await prisma.question.findUnique({ where: { id: body.questionId }, select: { id: true } });
+  if (!question) return reply.code(404).send({ error: "Question not found." });
+  const issue = await prisma.questionIssue.upsert({
+    where: { attemptId_questionId: { attemptId, questionId: question.id } },
+    create: {
+      attemptId,
+      questionId: question.id,
+      userId: request.auth!.userId,
+      category: body.category,
+      note: typeof body.note === "string" ? body.note.trim() : ""
+    },
+    update: {
+      category: body.category,
+      note: typeof body.note === "string" ? body.note.trim() : "",
+      status: "OPEN",
+      adminNote: ""
+    }
+  });
+  await audit(request.auth!.userId, "question_issue.reported", "QuestionIssue", issue.id, { attemptId, questionId: question.id });
+  return reply.code(201).send({ id: issue.id, status: issue.status });
+});
+
 app.post("/api/student/answers", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
   const parsed = AnswerSubmissionSchema.safeParse(request.body);
   if (!parsed.success) return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? "Invalid answer." });
@@ -1732,7 +2019,10 @@ app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, require
   if (submittedQuestionIds.length !== questionIds.length || questionIds.some((questionId) => !(questionId in submission.answers))) {
     return reply.code(400).send({ error: "The final snapshot must include every question in this attempt." });
   }
-  const questions = await prisma.question.findMany({ where: { id: { in: questionIds } } });
+  const questions = await prisma.question.findMany({
+    where: { id: { in: questionIds } },
+    include: { topic: { select: { id: true, title: true, parentId: true } } }
+  });
   const questionMap = new Map(questions.map((question) => [question.id, question]));
   for (const [questionId, selectedOptionIds] of Object.entries(submission.answers)) {
     const question = questionMap.get(questionId);
@@ -1773,11 +2063,20 @@ app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, require
             payloadHash
           }
         });
-        await Promise.all(questionIds.map((questionId) => transaction.answer.upsert({
-          where: { attemptId_questionId: { attemptId: id, questionId } },
-          create: { attemptId: id, questionId, selectedOptionIds: JSON.stringify(submission.answers[questionId]) },
-          update: { selectedOptionIds: JSON.stringify(submission.answers[questionId]) }
-        })));
+        await Promise.all(questionIds.map((questionId) => {
+          const question = questionMap.get(questionId)!;
+          const questionSnapshot = captureQuestionSnapshot(question);
+          return transaction.answer.upsert({
+            where: { attemptId_questionId: { attemptId: id, questionId } },
+            create: {
+              attemptId: id,
+              questionId,
+              selectedOptionIds: JSON.stringify(submission.answers[questionId]),
+              questionSnapshot
+            },
+            update: { selectedOptionIds: JSON.stringify(submission.answers[questionId]), questionSnapshot }
+          });
+        }));
       });
     } catch (error) {
       if (error instanceof Error && error.message === "FINAL_SNAPSHOT_ALREADY_ACCEPTED") {
@@ -1824,6 +2123,9 @@ app.post("/api/student/attempts/:id/submit", { preHandler: [requireCsrf, require
     if (graded?.status === "GRADED") return gradedSummary(id);
     return reply.code(409).send({ error: "Attempt was already submitted." });
   }
+  if (attempt.exam.isPractice) {
+    await prisma.exam.update({ where: { id: attempt.examId }, data: { status: "CLOSED" } });
+  }
   await audit(request.auth!.userId, "exam_attempt.submitted", "ExamAttempt", id, { score });
   const topics = await prisma.topic.findMany({ where: { id: { in: [...breakdown.keys()] } }, select: { id: true, title: true, parentId: true } });
   const topicMap = new Map(topics.map((topic) => [topic.id, topic]));
@@ -1851,20 +2153,34 @@ app.get("/api/student/results/:id/review", { preHandler: requireStudent }, async
     include: { topic: { select: { id: true, title: true, parentId: true } } }
   });
   const questionMap = new Map(questions.map((question) => [question.id, question]));
-  const answers = new Map(attempt.answers.map((answer) => [answer.questionId, JSON.parse(answer.selectedOptionIds) as string[]]));
+  const answers = new Map(attempt.answers.map((answer) => [answer.questionId, answer]));
   return {
     examTitle: attempt.exam.title,
     score: attempt.score,
     questions: questionIds.map((questionId) => {
       const question = questionMap.get(questionId)!;
+      const answer = answers.get(questionId);
+      const snapshot = answer?.questionSnapshot
+        ? JSON.parse(answer.questionSnapshot) as {
+            stem: string;
+            options: Array<{ id: string; text: string }>;
+            correctOptionIds: string[];
+            explanation: string;
+            topicId: string;
+            topicTitle: string;
+            topicParentId: string | null;
+          }
+        : null;
       return {
         id: question.id,
-        stem: question.stem,
-        options: JSON.parse(question.options),
-        correctOptionIds: JSON.parse(question.correctOptionIds),
-        selectedOptionIds: answers.get(questionId) ?? [],
-        explanation: question.explanation,
-        topic: question.topic
+        stem: snapshot?.stem ?? question.stem,
+        options: snapshot?.options ?? JSON.parse(question.options),
+        correctOptionIds: snapshot?.correctOptionIds ?? JSON.parse(question.correctOptionIds),
+        selectedOptionIds: answer ? JSON.parse(answer.selectedOptionIds) as string[] : [],
+        explanation: snapshot?.explanation ?? question.explanation,
+        topic: snapshot
+          ? { id: snapshot.topicId, title: snapshot.topicTitle, parentId: snapshot.topicParentId }
+          : question.topic
       };
     })
   };
@@ -1877,6 +2193,99 @@ app.get("/api/student/results", { preHandler: requireStudent }, async (request: 
     orderBy: { submittedAt: "desc" }
   })
 );
+
+async function studentPerformance(userId: string) {
+  const attempts = await prisma.examAttempt.findMany({
+    where: { userId, status: "GRADED" },
+    include: { exam: { select: { title: true, marksPerQuestion: true } }, answers: true },
+    orderBy: { submittedAt: "asc" }
+  });
+  const questionIds = [...new Set(attempts.flatMap((attempt) => JSON.parse(attempt.questionOrder) as string[]))];
+  const questions = await prisma.question.findMany({
+    where: { id: { in: questionIds } },
+    select: { id: true, correctOptionIds: true, topic: { select: { id: true, title: true } } }
+  });
+  const questionsById = new Map(questions.map((question) => [question.id, question]));
+  const topicTotals = new Map<string, { topicId: string; title: string; correct: number; total: number }>();
+  const trend = attempts.map((attempt) => {
+    const ids = JSON.parse(attempt.questionOrder) as string[];
+    const denominator = ids.length * attempt.exam.marksPerQuestion;
+    const score = attempt.score ?? 0;
+    const percent = denominator > 0 ? Math.max(0, Math.min(100, Math.round((score / denominator) * 100))) : 0;
+    const answersByQuestion = new Map(attempt.answers.map((answer) => [answer.questionId, answer]));
+    for (const questionId of ids) {
+      const question = questionsById.get(questionId);
+      if (!question) continue;
+      const answer = answersByQuestion.get(questionId);
+      const selected = answer ? JSON.parse(answer.selectedOptionIds) as string[] : [];
+      const snapshot = answer?.questionSnapshot
+        ? JSON.parse(answer.questionSnapshot) as { correctOptionIds: string[]; topicId: string; topicTitle: string }
+        : null;
+      const correctIds = snapshot?.correctOptionIds ?? JSON.parse(question.correctOptionIds) as string[];
+      const isCorrect = selected.length === correctIds.length && correctIds.every((id) => selected.includes(id));
+      const topicId = snapshot?.topicId ?? question.topic.id;
+      const topicTitle = snapshot?.topicTitle ?? question.topic.title;
+      const topicTotal = topicTotals.get(topicId) ?? {
+        topicId,
+        title: topicTitle,
+        correct: 0,
+        total: 0
+      };
+      topicTotal.total += 1;
+      if (isCorrect) topicTotal.correct += 1;
+      topicTotals.set(topicId, topicTotal);
+    }
+    return {
+      id: attempt.id,
+      examTitle: attempt.exam.title,
+      attemptNumber: attempt.attemptNumber,
+      score,
+      maxScore: denominator,
+      percent,
+      submittedAt: attempt.submittedAt
+    };
+  });
+  const topics = [...topicTotals.values()]
+    .map((topic) => ({ ...topic, accuracy: Math.round((topic.correct / topic.total) * 100) }))
+    .sort((left, right) => left.accuracy - right.accuracy || left.title.localeCompare(right.title));
+  return { trend: trend.slice(-20), topics, weakTopics: topics.filter((topic) => topic.accuracy < 80).slice(0, 3) };
+}
+
+app.get("/api/student/analytics", { preHandler: requireStudent }, async (request: AuthenticatedRequest) =>
+  studentPerformance(request.auth!.userId)
+);
+
+app.post("/api/student/practice-sets", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
+  const { weakTopics } = await studentPerformance(request.auth!.userId);
+  if (!weakTopics.length) return reply.code(409).send({ error: "Complete a graded exam and have a topic below 80% before generating focused practice." });
+  const candidates = await prisma.question.findMany({
+    where: { status: "APPROVED", topicId: { in: weakTopics.map((topic) => topic.topicId) } },
+    select: { id: true, topicId: true }
+  });
+  const selected = shuffleArray(candidates).slice(0, 10);
+  if (!selected.length) return reply.code(409).send({ error: "No approved questions are available for your current focus topics." });
+  const topicNames = weakTopics.map((topic) => topic.title).join(", ");
+  const exam = await prisma.exam.create({
+    data: {
+      title: `Focused practice: ${weakTopics[0]!.title}`,
+      description: `Practice based on recent results: ${topicNames}.`,
+      durationMinutes: 20,
+      questionCount: selected.length,
+      selectionRules: JSON.stringify({ topicIds: weakTopics.map((topic) => topic.topicId) }),
+      shuffleQuestions: true,
+      shuffleOptions: true,
+      marksPerQuestion: 1,
+      negativeMarking: false,
+      negativeMarks: 0,
+      isPractice: true,
+      status: "ACTIVE",
+      students: { create: { userId: request.auth!.userId } },
+      items: { create: selected.map(({ id: questionId }, position) => ({ questionId, position })) }
+    }
+  });
+  await audit(request.auth!.userId, "practice_set.generated", "Exam", exam.id, { questionCount: selected.length, topicIds: weakTopics.map((topic) => topic.topicId) });
+  return reply.code(201).send({ examId: exam.id, title: exam.title, questionCount: selected.length });
+});
 
 app.get("/api/admin/lan", { preHandler: requireAdmin }, async (request) => {
   const interfaces = Object.values((await import("node:os")).networkInterfaces()).flat();
@@ -1914,6 +2323,7 @@ async function start(): Promise<void> {
   await prisma.$queryRawUnsafe("PRAGMA journal_mode=WAL");
   await prisma.$executeRawUnsafe("PRAGMA synchronous=FULL");
   await ensureBranding();
+  await backfillHistoricalQuestionSnapshots();
   await createFirstAdmin();
   await app.register(fastifyStatic, {
     root: path.resolve("../web/dist"),

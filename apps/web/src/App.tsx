@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent, type FormEvent, type MouseEvent, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Papa from "papaparse";
 import { QRCodeSVG } from "qrcode.react";
@@ -29,7 +29,7 @@ import {
   type ExamPackage
 } from "./examStore";
 
-type Page = "overview" | "classes" | "students" | "questions" | "lessons" | "syllabus" | "exams" | "settings";
+type Page = "overview" | "analytics" | "classes" | "students" | "questions" | "question-reports" | "lessons" | "syllabus" | "exams" | "settings";
 type Dashboard = { studentCount: number; classCount: number; questionCount: number; activeExams: number; attempts: number };
 type ClassRecord = { id: string; name: string; status: "ACTIVE" | "INACTIVE"; _count: { enrollments: number } };
 type StudentRecord = {
@@ -74,6 +74,9 @@ function App() {
   const queryClient = useQueryClient();
   const [user, setUser] = useState<User | null>(null);
   const [page, setPage] = useState<Page>("overview");
+  const [reportedQuestionId, setReportedQuestionId] = useState("");
+  const openReportedQuestion = useCallback((id: string) => { setReportedQuestionId(id); setPage("questions"); }, []);
+  const clearReportedQuestion = useCallback(() => setReportedQuestionId(""), []);
   const [loginError, setLoginError] = useState("");
   const brandingQuery = useQuery({ queryKey: ["branding"], queryFn: () => api<Branding>("/api/settings/branding") });
   const branding = brandingQuery.data ?? emptyBranding;
@@ -123,7 +126,7 @@ function App() {
   return (
     <Shell user={user} branding={branding} page={page} onPage={setPage} onLogout={() => void logout()}>
       {user.role === "ADMIN"
-        ? <AdminPage page={page} branding={branding} onNavigate={setPage} onBrandingSaved={(next) => queryClient.setQueryData(["branding"], next)} />
+        ? <AdminPage page={page} branding={branding} onNavigate={setPage} onBrandingSaved={(next) => queryClient.setQueryData(["branding"], next)} reportedQuestionId={reportedQuestionId} onQuestionEditOpened={clearReportedQuestion} onRequestQuestionEdit={openReportedQuestion} />
         : <StudentPage user={user} />}
     </Shell>
   );
@@ -211,9 +214,11 @@ function ChangePasswordPage({ user }: { user: User }) {
 
 const adminNavigation: Array<{ id: Page; label: string; icon: typeof LayoutDashboard }> = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
+  { id: "analytics", label: "Analytics", icon: Activity },
   { id: "classes", label: "Classes", icon: GraduationCap },
   { id: "students", label: "Students", icon: Users },
   { id: "questions", label: "Question bank", icon: CircleHelp },
+  { id: "question-reports", label: "Question reports", icon: Activity },
   { id: "lessons", label: "Lessons", icon: BookOpen },
   { id: "syllabus", label: "Syllabus", icon: BookOpen },
   { id: "exams", label: "Exams", icon: Boxes },
@@ -260,12 +265,14 @@ function PageHeader({ eyebrow, title, description, action }: { eyebrow?: string;
   return <div className="page-header"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1>{description && <p>{description}</p>}</div>{action}</div>;
 }
 
-function AdminPage({ page, branding, onNavigate, onBrandingSaved }: { page: Page; branding: Branding; onNavigate: (page: Page) => void; onBrandingSaved: (branding: Branding) => void }) {
+function AdminPage({ page, branding, onNavigate, onBrandingSaved, reportedQuestionId, onQuestionEditOpened, onRequestQuestionEdit }: { page: Page; branding: Branding; onNavigate: (page: Page) => void; onBrandingSaved: (branding: Branding) => void; reportedQuestionId: string; onQuestionEditOpened: () => void; onRequestQuestionEdit: (id: string) => void }) {
   switch (page) {
     case "overview": return <DashboardPage onNavigate={onNavigate} />;
+    case "analytics": return <AnalyticsPage />;
     case "classes": return <ClassesPage />;
     case "students": return <StudentsPage />;
-    case "questions": return <QuestionsPage />;
+    case "questions": return <QuestionsPage questionToEdit={reportedQuestionId} onQuestionEditOpened={onQuestionEditOpened} />;
+    case "question-reports": return <QuestionReportsPage onEditQuestion={onRequestQuestionEdit} />;
     case "lessons": return <AdminLessonsPage />;
     case "syllabus": return <SyllabusPage />;
     case "exams": return <ExamsPage />;
@@ -440,7 +447,7 @@ function StudentsPage() {
 function StatusPill({ status }: { status: string }) { return <span className={`status-pill ${status === "ACTIVE" || status === "APPROVED" ? "status-good" : "status-muted"}`}>{status.toLowerCase()}</span>; }
 function EmptyRow({ columns, text }: { columns: number; text: string }) { return <tr><td colSpan={columns} className="empty-row">{text}</td></tr>; }
 
-function QuestionsPage() {
+function QuestionsPage({ questionToEdit, onQuestionEditOpened }: { questionToEdit: string; onQuestionEditOpened: () => void }) {
   const client = useQueryClient();
   const topics = useQuery({ queryKey: ["topics"], queryFn: () => api<TopicRecord[]>("/api/topics") });
   const questions = useQuery({ queryKey: ["questions"], queryFn: () => api<QuestionRecord[]>("/api/admin/questions") });
@@ -460,6 +467,23 @@ function QuestionsPage() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<QuestionRecord | null>(null);
   const [selectedDraftIds, setSelectedDraftIds] = useState<string[]>([]);
+  useEffect(() => {
+    if (!questionToEdit || !questions.data) return;
+    let active = true;
+    const question = questions.data.find((record) => record.id === questionToEdit);
+    const loadQuestion = question
+      ? Promise.resolve(question)
+      : api<QuestionRecord>(`/api/admin/questions/${questionToEdit}`);
+    void loadQuestion.then((record) => {
+      if (!active) return;
+      setEditing(record);
+      setEditorOpen(true);
+      onQuestionEditOpened();
+    }).catch((cause: unknown) => {
+      if (active) setError(cause instanceof Error ? cause.message : "Could not open the reported question.");
+    });
+    return () => { active = false; };
+  }, [questionToEdit, questions.data, onQuestionEditOpened]);
   const filtered = useMemo(() => questions.data?.filter((question) =>
     question.stem.toLowerCase().includes(search.toLowerCase())
       && (!topicFilter || question.topicId === topicFilter)
@@ -939,6 +963,113 @@ function BackupManager() {
   </section>;
 }
 
+type QuestionIssueRecord = {
+  id: string;
+  category: "AMBIGUOUS" | "INCORRECT" | "TYPO" | "OTHER";
+  note: string;
+  status: "OPEN" | "RESOLVED" | "DISMISSED";
+  createdAt: string;
+  user: { id: string; username: string; displayName: string };
+  attempt: { attemptNumber: number; exam: { title: string } };
+  question: { id: string; stem: string; topic: { id: string; title: string } };
+};
+
+type AdminAnalyticsData = {
+  leaderboard: Array<{ id: string; username: string; displayName: string; attempts: number; latestSubmittedAt: string | null; averagePercent: number; classes: string[] }>;
+  heatmap: Array<{ classId: string; className: string; topicId: string; topicTitle: string; correct: number; total: number; accuracy: number }>;
+  itemAnalysis: Array<{ questionId: string; stem: string; topicTitle: string; attempts: number; correct: number; accuracy: number; optionSelections: Record<string, number>; optionLabels: Record<string, string> }>;
+  auditLog: Array<{ id: string; action: string; entityType: string; entityId: string | null; details: string; createdAt: string; actor: { username: string; displayName: string } | null }>;
+};
+
+function AnalyticsPage() {
+  const analytics = useQuery({ queryKey: ["admin-analytics"], queryFn: () => api<AdminAnalyticsData>("/api/admin/analytics") });
+  const downloadCsv = () => {
+    if (!analytics.data) return;
+    const csv = Papa.unparse(analytics.data.leaderboard.map((student, index) => ({
+      rank: index + 1,
+      student: student.displayName,
+      username: student.username,
+      classes: student.classes.join(", "),
+      gradedAttempts: student.attempts,
+      averageScorePercent: student.averagePercent,
+      latestSubmission: student.latestSubmittedAt ?? ""
+    })));
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "chemarena-student-report-cards.csv";
+    anchor.click();
+    URL.revokeObjectURL(url);
+  };
+  return <div className="page-stack">
+    <PageHeader eyebrow="PHASE 4 · ANALYTICS" title="Learning analytics" description="Review student outcomes, topic coverage, question performance and recent administrative activity." action={<div className="action-cell"><button className="button button-outline" onClick={downloadCsv} disabled={!analytics.data?.leaderboard.length}>Download CSV</button><button className="button button-primary" onClick={() => window.print()} disabled={!analytics.data?.leaderboard.length}>Print / Save PDF</button></div>} />
+    {analytics.error && <ErrorNotice message={(analytics.error as Error).message} />}
+    <section className="card table-card">
+      <div className="table-title"><h2>Student report cards</h2><span className="muted">Ranked by average percentage across graded attempts</span></div>
+      <div className="analytics-report-cards">{analytics.data?.leaderboard.map((student, index) => <article className="analytics-report-card" key={student.id}>
+        <span className="eyebrow">RANK {index + 1}</span><h3>{student.displayName}</h3><p><code>{student.username}</code> · {student.classes.join(", ") || "No class"}</p>
+        <strong>{student.averagePercent}%</strong><small>{student.attempts} graded attempt{student.attempts === 1 ? "" : "s"} · Latest: {student.latestSubmittedAt ? new Date(student.latestSubmittedAt).toLocaleDateString() : "—"}</small>
+      </article>)}</div>
+      {!analytics.data?.leaderboard.length && <p className="muted">{analytics.isLoading ? "Calculating results…" : "Graded attempts will appear here."}</p>}
+    </section>
+    <section className="card table-card"><div className="table-title"><h2>Class-by-topic performance</h2></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Syllabus topic</th><th>Correct</th><th>Accuracy</th></tr></thead><tbody>
+      {analytics.data?.heatmap.map((cell) => <tr key={`${cell.classId}:${cell.topicId}`}><td>{cell.className}</td><td>{cell.topicTitle}</td><td>{cell.correct} / {cell.total}</td><td><span className={`heat-cell ${cell.accuracy >= 80 ? "heat-high" : cell.accuracy >= 50 ? "heat-mid" : "heat-low"}`}>{cell.accuracy}%</span></td></tr>)}
+      {!analytics.data?.heatmap.length && <EmptyRow columns={4} text={analytics.isLoading ? "Loading topic results…" : "Class topic results will appear after graded exams."} />}
+    </tbody></table></div></section>
+    <section className="card table-card"><div className="table-title"><h2>Question item analysis</h2><span className="muted">Accuracy across submitted answers</span></div><div className="table-wrap"><table><thead><tr><th>Question</th><th>Topic</th><th>Attempts</th><th>Correct</th><th>Accuracy</th><th>Option selections</th></tr></thead><tbody>
+      {analytics.data?.itemAnalysis.map((item) => <tr key={item.questionId}><td className="strong-cell">{item.stem}</td><td>{item.topicTitle}</td><td>{item.attempts}</td><td>{item.correct}</td><td>{item.accuracy}%</td><td>{Object.entries(item.optionSelections).map(([optionId, count]) => `${optionId.toUpperCase()} (${item.optionLabels[optionId] ?? optionId}): ${count}`).join(" · ") || "—"}</td></tr>)}
+      {!analytics.data?.itemAnalysis.length && <EmptyRow columns={6} text={analytics.isLoading ? "Analyzing questions…" : "Question analysis will appear after graded exams."} />}
+    </tbody></table></div></section>
+    <section className="card table-card"><div className="table-title"><h2>Recent audit activity</h2><span className="muted">Latest 100 events</span></div><div className="table-wrap"><table><thead><tr><th>Time</th><th>Administrator</th><th>Action</th><th>Record</th><th>Details</th></tr></thead><tbody>
+      {analytics.data?.auditLog.map((event) => <tr key={event.id}><td>{new Date(event.createdAt).toLocaleString()}</td><td>{event.actor?.displayName ?? "System"}</td><td>{event.action}</td><td>{event.entityType}{event.entityId ? ` · ${event.entityId}` : ""}</td><td><code>{event.details}</code></td></tr>)}
+      {!analytics.data?.auditLog.length && <EmptyRow columns={5} text={analytics.isLoading ? "Loading audit events…" : "No audit events recorded."} />}
+    </tbody></table></div></section>
+  </div>;
+}
+
+function QuestionReportsPage({ onEditQuestion }: { onEditQuestion: (id: string) => void }) {
+  const client = useQueryClient();
+  const [statusFilter, setStatusFilter] = useState("OPEN");
+  const issues = useQuery({
+    queryKey: ["question-issues", statusFilter],
+    queryFn: () => api<QuestionIssueRecord[]>(`/api/admin/question-issues${statusFilter ? `?status=${statusFilter}` : ""}`)
+  });
+  const updateStatus = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: QuestionIssueRecord["status"] }) =>
+      api(`/api/admin/question-issues/${id}`, { method: "PATCH", body: JSON.stringify({ status }) }),
+    onSuccess: () => void client.invalidateQueries({ queryKey: ["question-issues"] })
+  });
+  const categoryLabels: Record<QuestionIssueRecord["category"], string> = {
+    AMBIGUOUS: "Ambiguous wording or answers",
+    INCORRECT: "Possibly incorrect question or key",
+    TYPO: "Typo or formatting issue",
+    OTHER: "Other issue"
+  };
+  return <div className="page-stack">
+    <PageHeader eyebrow="PHASE 4 · REVIEW" title="Student question reports" description="Review questionable exam items, correct the question bank, then resolve or dismiss each report." />
+    {issues.error && <ErrorNotice message={(issues.error as Error).message} />}
+    {updateStatus.error && <ErrorNotice message={(updateStatus.error as Error).message} />}
+    <section className="card table-card">
+      <div className="table-title"><h2>Reports</h2><label>Show<select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="OPEN">Open</option><option value="RESOLVED">Resolved</option><option value="DISMISSED">Dismissed</option><option value="">All</option></select></label></div>
+      <div className="table-wrap"><table><thead><tr><th>Question and topic</th><th>Report</th><th>Student and exam</th><th>Received</th><th>Actions</th></tr></thead><tbody>
+        {issues.data?.map((issue) => <tr key={issue.id}>
+          <td className="strong-cell">{issue.question.stem}<small className="table-subtitle">{issue.question.topic.title}</small></td>
+          <td>{categoryLabels[issue.category]}{issue.note && <small className="table-subtitle">{issue.note}</small>}</td>
+          <td>{issue.user.displayName}<small className="table-subtitle">{issue.attempt.exam.title} · Attempt #{issue.attempt.attemptNumber}</small></td>
+          <td>{new Date(issue.createdAt).toLocaleString()}</td>
+          <td className="action-cell">
+            <button className="button button-outline button-small" onClick={() => onEditQuestion(issue.question.id)}>Correct question</button>
+            {issue.status !== "RESOLVED" && <button className="button button-primary button-small" disabled={updateStatus.isPending} onClick={() => updateStatus.mutate({ id: issue.id, status: "RESOLVED" })}>Resolve</button>}
+            {issue.status !== "DISMISSED" && <button className="button button-outline button-small" disabled={updateStatus.isPending} onClick={() => updateStatus.mutate({ id: issue.id, status: "DISMISSED" })}>Dismiss</button>}
+            {issue.status !== "OPEN" && <button className="button button-outline button-small" disabled={updateStatus.isPending} onClick={() => updateStatus.mutate({ id: issue.id, status: "OPEN" })}>Reopen</button>}
+          </td>
+        </tr>)}
+        {!issues.data?.length && <EmptyRow columns={5} text={issues.isLoading ? "Loading reports…" : "No reports in this view."} />}
+      </tbody></table></div>
+    </section>
+  </div>;
+}
+
 function ExamsPage() {
   const client = useQueryClient();
   const exams = useQuery({ queryKey: ["admin-exams"], queryFn: () => api<ExamRecord[]>("/api/admin/exams") });
@@ -1173,6 +1304,7 @@ function StudentPage({ user }: { user: User }) {
     void exams.refetch();
   }} />;
   return <div className="page-stack"><PageHeader eyebrow="YOUR LEARNING" title="Welcome to ChemArena" description="Practise organic chemistry and prepare for your next computer-based test." />
+    <StudentAnalyticsPanel onPracticeStart={(examId) => start.mutate(examId)} />
     {startError && <ErrorNotice message={startError} />}
     {review.data && <section className="card review-card"><div className="table-title"><div><span className="eyebrow">ANSWER REVIEW</span><h2>{review.data.examTitle} · Score {review.data.score}</h2></div><button className="icon-button" onClick={() => setReviewId("")}><X /></button></div>
       {review.data.questions.map((question, index) => <article key={question.id} className="review-question"><strong>{index + 1}. {question.stem}</strong><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : question.selectedOptionIds.includes(option.id) ? "option-wrong" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div><p>{question.explanation}</p></article>)}
@@ -1201,6 +1333,38 @@ type ReviewData = {
     correctOptionIds: string[]; selectedOptionIds: string[]; explanation: string; topic: TopicRecord;
   }>;
 };
+
+type StudentAnalyticsData = {
+  trend: Array<{ id: string; examTitle: string; attemptNumber: number; score: number; maxScore: number; percent: number; submittedAt: string | null }>;
+  topics: Array<{ topicId: string; title: string; correct: number; total: number; accuracy: number }>;
+  weakTopics: Array<{ topicId: string; title: string; correct: number; total: number; accuracy: number }>;
+};
+
+function StudentAnalyticsPanel({ onPracticeStart }: { onPracticeStart: (examId: string) => void }) {
+  const analytics = useQuery({ queryKey: ["student-analytics"], queryFn: () => api<StudentAnalyticsData>("/api/student/analytics") });
+  const [error, setError] = useState("");
+  const practice = useMutation({
+    mutationFn: () => api<{ examId: string }>("/api/student/practice-sets", { method: "POST", body: "{}" }),
+    onSuccess: ({ examId }) => { setError(""); onPracticeStart(examId); },
+    onError: (cause: Error) => setError(cause.message)
+  });
+  return <>
+    {analytics.error && <ErrorNotice message={(analytics.error as Error).message} />}
+    {error && <ErrorNotice message={error} />}
+    <section className="card table-card">
+      <div className="table-title"><h2>Score trend</h2><span className="muted">Recent graded attempts</span></div>
+      {analytics.data?.trend.length
+        ? <div className="trend-list">{analytics.data.trend.map((result) => <div className="trend-row" key={result.id}><div><strong>{result.examTitle} · #{result.attemptNumber}</strong><small>{result.submittedAt ? new Date(result.submittedAt).toLocaleDateString() : "Submitted"}</small></div><progress max={100} value={result.percent} aria-label={`${result.percent}% on ${result.examTitle}`} /><strong>{result.percent}%</strong></div>)}</div>
+        : <p className="muted">{analytics.isLoading ? "Loading your progress…" : "Complete a graded exam to see your score trend."}</p>}
+    </section>
+    <section className="card table-card">
+      <div className="table-title"><h2>Topics to practise</h2><button className="button button-primary button-small" disabled={practice.isPending || !analytics.data?.weakTopics.length} onClick={() => practice.mutate()}>{practice.isPending ? "Preparing…" : "Generate focused practice"}</button></div>
+      {analytics.data?.weakTopics.length
+        ? <div className="topic-focus-list">{analytics.data.weakTopics.map((topic) => <div className="topic-focus-row" key={topic.topicId}><span>{topic.title}<small>{topic.correct} correct out of {topic.total} questions</small></span><strong>{topic.accuracy}%</strong></div>)}</div>
+        : <p className="muted">{analytics.isLoading ? "Checking topic results…" : analytics.data?.topics.length ? "No topic is currently below 80%. Keep up the good work." : "Topic recommendations appear after a graded exam."}</p>}
+    </section>
+  </>;
+}
 
 function createIdempotencyKey(): string {
   const bytes = new Uint8Array(16);
@@ -1233,9 +1397,27 @@ function CBTPlayer({ cachedAttempt, onExit }: { cachedAttempt: CachedExamAttempt
   const [result, setResult] = useState<{ score: number; maxScore: number; topicBreakdown: Array<{ topic: TopicRecord; correct: number; total: number; score: number }> } | null>(null);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportCategory, setReportCategory] = useState<QuestionIssueRecord["category"]>("INCORRECT");
+  const [reportNote, setReportNote] = useState("");
+  const [reportError, setReportError] = useState("");
+  const [reportMessage, setReportMessage] = useState("");
   const submittedRef = useRef(false);
   const timerExpiredRef = useRef(false);
   const currentQuestion = examPackage.questions[current]!;
+  const reportIssue = useMutation({
+    mutationFn: () => api<{ id: string; status: string }>(`/api/student/attempts/${examPackage.attemptId}/question-issues`, {
+      method: "POST",
+      body: JSON.stringify({ questionId: currentQuestion.id, category: reportCategory, note: reportNote })
+    }),
+    onSuccess: () => {
+      setReportError("");
+      setReportMessage("Report sent to your teacher for review.");
+      setReportNote("");
+      setReportOpen(false);
+    },
+    onError: (cause: Error) => setReportError(cause.message)
+  });
 
   useEffect(() => {
     void getCachedAttempt(examPackage.attemptId).then((cached) => {
@@ -1445,8 +1627,16 @@ function CBTPlayer({ cachedAttempt, onExit }: { cachedAttempt: CachedExamAttempt
     <header className="cbt-header"><div><span className="eyebrow">COMPUTER-BASED TEST</span><h1>{examPackage.exam.title}</h1></div><div className="cbt-header-right"><span className={`save-status save-${saveState}`}><i />{saveState === "saved" ? "Saved" : saveState === "saving" ? `Saving${pendingAnswerCount ? ` (${pendingAnswerCount})` : ""}…` : "Offline — answers safe on this device"}</span><div className={`countdown ${remaining < 60_000 ? "countdown-urgent" : ""}`}><span>TIME LEFT</span><strong>{formatTime(remaining)}</strong></div></div></header>
     {isFrozen && !result && <div className="notice notice-warning">Your final answers are frozen on this device. ChemArena will keep retrying until the server confirms your submission.</div>}
     {error && <div className="cbt-error"><ErrorNotice message={error} /><button className="button button-outline button-small" onClick={() => void submit(false)}>Retry submit</button></div>}
+    {reportMessage && <div role="status" className="notice notice-success">{reportMessage}</div>}
+    {reportError && <ErrorNotice message={reportError} />}
     {fullScreenWarning && <div className="notice notice-error">{fullScreenWarning}</div>}
-    <div className="cbt-layout"><main className="cbt-question-area"><div className="cbt-question-top"><span>QUESTION {current + 1} <span className="muted">OF {examPackage.questions.length}</span></span><button className={`button button-small ${flags.includes(currentQuestion.id) ? "button-flag-active" : "button-outline"}`} onClick={() => toggleFlag(currentQuestion.id)}>{flags.includes(currentQuestion.id) ? "★ Flagged" : "☆ Flag for review"}</button></div>
+    {reportOpen && <form className="card form-card" onSubmit={(event) => { event.preventDefault(); reportIssue.mutate(); }}>
+      <h2>Report question {current + 1}</h2>
+      <label>What should your teacher review?<select value={reportCategory} onChange={(event) => setReportCategory(event.target.value as QuestionIssueRecord["category"])}><option value="INCORRECT">Possibly incorrect question or answer</option><option value="AMBIGUOUS">Ambiguous wording or answers</option><option value="TYPO">Typo or formatting issue</option><option value="OTHER">Other issue</option></select></label>
+      <label>Details (optional)<textarea value={reportNote} onChange={(event) => setReportNote(event.target.value)} maxLength={1000} rows={3} /></label>
+      <div className="editor-actions"><button type="button" className="button button-outline" onClick={() => { setReportOpen(false); setReportError(""); }}>Cancel</button><button className="button button-primary" disabled={reportIssue.isPending || isFrozen}>{reportIssue.isPending ? "Sending…" : "Send report"}</button></div>
+    </form>}
+    <div className="cbt-layout"><main className="cbt-question-area"><div className="cbt-question-top"><span>QUESTION {current + 1} <span className="muted">OF {examPackage.questions.length}</span></span><div><button className={`button button-small ${flags.includes(currentQuestion.id) ? "button-flag-active" : "button-outline"}`} onClick={() => toggleFlag(currentQuestion.id)}>{flags.includes(currentQuestion.id) ? "★ Flagged" : "☆ Flag for review"}</button><button className="button button-outline button-small" onClick={() => { setReportOpen(true); setReportMessage(""); setReportError(""); }} disabled={isFrozen}>Report question</button></div></div>
       <article className="cbt-question"><h2>{currentQuestion.stem}</h2>{currentQuestion.smiles && <SmilesPreview smiles={currentQuestion.smiles} />}{currentQuestion.imageDataUrl && <img className="question-image" src={currentQuestion.imageDataUrl} alt="Question structure" />}
         <div className="cbt-options">{currentQuestion.options.map((option, index) => <button key={option.id} disabled={isFrozen} className={`cbt-option ${(answers[currentQuestion.id] ?? []).includes(option.id) ? "cbt-option-selected" : ""}`} onClick={() => selectOption(currentQuestion.id, option.id)}><span className="cbt-option-letter">{String.fromCharCode(65 + index)}</span><span>{option.text}</span><i>{(answers[currentQuestion.id] ?? []).includes(option.id) ? "✓" : ""}</i></button>)}</div>
       </article>

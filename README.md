@@ -80,6 +80,7 @@ The provided syllabus image does **not** specify exam question count, duration o
 - The player uses a monotonic countdown while open and corrects it with the server deadline whenever the server can be reached. At zero, it freezes one complete local answer snapshot and retries submission until the server confirms grading.
 - The server grades only after receiving that final snapshot. It accepts exactly one frozen final snapshot per attempt, including after the normal answer grace window, so a disconnected student can finish syncing. The server cannot prove when edits in an unsynced snapshot were made; this is a deliberate availability trade-off, not tamper-proof offline testing.
 - The **Saved / Saving / Offline — answers safe on this device** indicator distinguishes server acknowledgement from local-only answers. No service worker is used; students must keep the exam tab open during a network outage. If the browser or device closes while both the app server and LAN are unreachable, the app shell cannot be reopened over plain HTTP until the server is reachable again.
+- The student's private **Flag for review** marker stays on that device. **Report question** sends a separate correction report to the server and requires a connection; if offline, students should continue and report the item after reconnecting.
 - SQLite uses WAL mode and full synchronous writes. ChemArena makes a timestamped automatic database snapshot every 15 minutes by default and keeps automatic snapshots for 7 days; older automatic snapshots are removed, while manual snapshots are retained. Change the schedule with `AUTO_BACKUP_INTERVAL_MINUTES` in `apps/server/.env`.
 - Backups are written to the repository's `backups` folder by default. Set `BACKUP_DIRECTORY` in `apps/server/.env` to use another local folder or drive; keep it on storage with enough free space and include it in normal system backups.
 - **Settings → Backups and restore** creates a consistent one-click backup and lists restore points. Restore validates the SQLite database, creates a safety backup of the current database, then restarts the server. The Windows `start.bat` launcher restarts it automatically; sign in again after restore. A server started directly with `npm run start --workspace @chemarena/server` must be started again manually after a restore.
@@ -146,6 +147,7 @@ For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, 
 - Admins can permanently delete a student from **Students**. This removes the account and all of that student's attempts, answers, and results; the deletion action itself remains in the audit log.
 - From an exam's **Monitor** view, an admin can grant a student one additional attempt using **Allow rewrite**. Each rewrite creates a numbered attempt and preserves earlier graded results. Students can only start a rewrite when the exam is still available and they have an unused grant.
 - Admins can permanently delete exams from **Exams**. This also deletes every linked attempt, answer, and result. The app shows a confirmation before deletion; this cannot be undone except by restoring a backup.
+- Graded answers retain a server-side question snapshot so later corrections do not rewrite previous answer reviews or analytics. Existing graded answers are snapshotted on startup; edits are blocked while any included attempt is still active or awaiting grading.
 - The LAN deployment uses plain HTTP as requested. Other people with access to an untrusted Wi-Fi network may be able to observe traffic; use a trusted, isolated school network and do not reuse personal passwords.
 - The exam package sent to a student does not contain correct-option IDs or explanations. Students can still inspect the question text and options delivered to their own browser; a client-side exam cannot prevent that.
 - Answers can be changed while the exam is open without a server connection, but local browser storage is not a substitute for a separate laptop/database backup. Students should not clear browser data, use private browsing, switch devices mid-exam, or close the exam tab during a dropout.
@@ -217,7 +219,7 @@ npm run db:seed
 5. Paste malformed and valid lesson JSON to confirm validation; verify the quiz must contain exactly ten valid MCQs.
 6. Use the question-bank prompt/paste path without an OpenAI key. Confirm imported questions remain Draft and review warnings are visible.
 7. Optionally configure a server-side OpenAI key, generate a lesson and a small question batch, and verify the content is staged/stored locally, marked AI/Draft, and not automatically published or approved. Do not put the API key in browser code or share it.
-8. After these manual checks, Phase 3 is ready for review before beginning Phase 4 analytics.
+8. These checks cover the Phase 3 content workflows; Phase 4 analytics and student question reports are described below.
 
 ## Admin account and exam controls checklist
 
@@ -227,6 +229,14 @@ npm run db:seed
 4. Permanently delete a disposable exam with attempts. Confirm the warning names the linked history, then verify the exam and its results are gone.
 5. Check that a student cannot grant retakes, delete accounts, or delete exams through the API.
 
+## Phase 4 progress checklist
+
+1. During an exam, use **Report question** (separate from the private **Flag for review** navigator marker) to submit a category and optional note.
+2. As admin, open **Question reports**, correct the item with **Correct question**, then mark the report resolved or dismiss it. Confirm the report is still available in its corresponding filter. Editing is blocked while that item is used by an active exam to preserve grading consistency.
+3. As a student with graded attempts, review the score trend and topic accuracy. If a topic is below 80% and approved questions exist for it, generate and complete a focused practice exam.
+4. As admin, review the leaderboard/report cards, class-by-topic results, item accuracy, and recent audit activity in **Analytics**. Export the CSV or use **Print / Save PDF**.
+5. Verify students cannot read other students' analytics or report lists, and cannot change report status through the API.
+
 ## Later phases
 
-- **Phase 4:** student/admin analytics, reports, weak-topic practice sets and expanded audit views.
+- **Phase 4 (in progress):** student score trends, weak-topic recommendations and practice sets; admin leaderboard, class-by-topic performance, question item analysis, CSV/printable report cards, recent audit activity; and student-reported question corrections are implemented. Further validation and usability improvements remain before calling the phase complete.

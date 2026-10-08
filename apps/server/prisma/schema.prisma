@@ -45,6 +45,19 @@ enum AttemptStatus {
   VOID
 }
 
+enum QuestionIssueStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+enum QuestionIssueCategory {
+  AMBIGUOUS
+  INCORRECT
+  TYPO
+  OTHER
+}
+
 model User {
   id                 String            @id @default(cuid())
   username           String            @unique
@@ -60,6 +73,7 @@ model User {
   lessonProgress     LessonProgress[]
   assignedExams      ExamStudent[]
   attempts           ExamAttempt[]
+  questionIssues     QuestionIssue[]
   examRetakeGrants   ExamRetakeGrant[]
   sessions           Session[]
   auditEvents        AuditLog[]        @relation("AuditActor")
@@ -179,23 +193,24 @@ model LessonProgress {
 }
 
 model Question {
-  id               String        @id @default(cuid())
+  id               String          @id @default(cuid())
   stem             String
   type             QuestionType
   options          String
   correctOptionIds String
-  explanation      String        @default("")
+  explanation      String          @default("")
   topicId          String
   difficulty       Int
-  tags             String        @default("[]")
+  tags             String          @default("[]")
   smiles           String?
   imageDataUrl     String?
-  status           ContentStatus @default(DRAFT)
-  source           String        @default("manual")
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
-  topic            Topic         @relation(fields: [topicId], references: [id])
+  status           ContentStatus   @default(DRAFT)
+  source           String          @default("manual")
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+  topic            Topic           @relation(fields: [topicId], references: [id])
   examItems        ExamItem[]
+  issues           QuestionIssue[]
 
   @@index([topicId, status, difficulty])
 }
@@ -212,6 +227,7 @@ model Exam {
   marksPerQuestion Float             @default(1)
   negativeMarking  Boolean           @default(false)
   negativeMarks    Float             @default(0)
+  isPractice       Boolean           @default(false)
   opensAt          DateTime?
   closesAt         DateTime?
   status           ExamStatus        @default(DRAFT)
@@ -221,6 +237,7 @@ model Exam {
   students         ExamStudent[]
   items            ExamItem[]
   attempts         ExamAttempt[]
+  issues           QuestionIssue[]
   retakeGrants     ExamRetakeGrant[]
 }
 
@@ -270,22 +287,23 @@ model ExamItem {
 }
 
 model ExamAttempt {
-  id            String        @id @default(cuid())
-  examId        String
-  userId        String
-  status        AttemptStatus @default(IN_PROGRESS)
-  attemptNumber Int           @default(1)
-  startedAt     DateTime      @default(now())
-  deadline      DateTime
-  submittedAt   DateTime?
-  score         Float?
-  questionOrder String
-  optionOrders  String
-  lastSeenAt    DateTime      @default(now())
-  exam          Exam          @relation(fields: [examId], references: [id])
-  user          User          @relation(fields: [userId], references: [id])
-  answers       Answer[]
-  syncEvents    SyncEvent[]
+  id             String          @id @default(cuid())
+  examId         String
+  userId         String
+  status         AttemptStatus   @default(IN_PROGRESS)
+  attemptNumber  Int             @default(1)
+  startedAt      DateTime        @default(now())
+  deadline       DateTime
+  submittedAt    DateTime?
+  score          Float?
+  questionOrder  String
+  optionOrders   String
+  lastSeenAt     DateTime        @default(now())
+  exam           Exam            @relation(fields: [examId], references: [id])
+  user           User            @relation(fields: [userId], references: [id])
+  answers        Answer[]
+  syncEvents     SyncEvent[]
+  questionIssues QuestionIssue[]
 
   @@unique([examId, userId, attemptNumber])
   @@index([examId, userId, startedAt])
@@ -297,10 +315,33 @@ model Answer {
   attemptId         String
   questionId        String
   selectedOptionIds String
+  questionSnapshot  String?
   updatedAt         DateTime    @updatedAt
   attempt           ExamAttempt @relation(fields: [attemptId], references: [id], onDelete: Cascade)
 
   @@unique([attemptId, questionId])
+}
+
+model QuestionIssue {
+  id         String                @id @default(cuid())
+  attemptId  String
+  questionId String
+  userId     String
+  category   QuestionIssueCategory
+  note       String                @default("")
+  status     QuestionIssueStatus   @default(OPEN)
+  adminNote  String                @default("")
+  createdAt  DateTime              @default(now())
+  updatedAt  DateTime              @updatedAt
+  attempt    ExamAttempt           @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+  question   Question              @relation(fields: [questionId], references: [id])
+  user       User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exam       Exam?                 @relation(fields: [examId], references: [id])
+  examId     String?
+
+  @@unique([attemptId, questionId])
+  @@index([status, createdAt])
+  @@index([questionId])
 }
 
 model Setting {
