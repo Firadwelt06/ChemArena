@@ -441,7 +441,7 @@ async function gradedSummary(attemptId: string) {
   const questionMap = new Map(questions.map((question) => [question.id, question]));
   const answerMap = new Map(attempt.answers.map((answer) => [answer.questionId, answer]));
   const breakdown = new Map<string, { topicId: string; correct: number; total: number; score: number }>();
-  for (const questionId of questionIds) {
+        for (const questionId of questionIds) {
     const question = questionMap.get(questionId);
     if (!question) continue;
     const answer = answerMap.get(questionId);
@@ -612,7 +612,7 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
     prisma.examAttempt.findMany({
       where: { status: "GRADED", exam: { isPractice: false } },
       include: {
-        exam: { select: { marksPerQuestion: true } },
+        exam: { select: { title: true, marksPerQuestion: true } },
         user: { select: { id: true, username: true, displayName: true, enrollments: { select: { class: { select: { id: true, name: true } } } } } },
         answers: true
       },
@@ -638,6 +638,28 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
     totalPercent: number;
     classes: Map<string, string>;
     latestSubmittedAt: Date | null;
+  }>();
+  const studentScores: Array<{
+    id: string;
+    studentId: string;
+    studentName: string;
+    username: string;
+    classes: string[];
+    examTitle: string;
+    attemptNumber: number;
+    score: number;
+    maximumScore: number;
+    percent: number;
+    submittedAt: Date | null;
+  }> = [];
+  const studentTopics = new Map<string, {
+    studentId: string;
+    studentName: string;
+    username: string;
+    topicId: string;
+    topicTitle: string;
+    correct: number;
+    total: number;
   }>();
   const heatmap = new Map<string, {
     classId: string;
@@ -673,6 +695,19 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
     student.totalPercent += percent;
     attempt.user.enrollments.forEach(({ class: record }) => student.classes.set(record.id, record.name));
     leaderboard.set(attempt.user.id, student);
+    studentScores.push({
+      id: attempt.id,
+      studentId: attempt.user.id,
+      studentName: attempt.user.displayName,
+      username: attempt.user.username,
+      classes: attempt.user.enrollments.map(({ class: record }) => record.name).sort(),
+      examTitle: attempt.exam.title,
+      attemptNumber: attempt.attemptNumber,
+      score: attempt.score ?? 0,
+      maximumScore: denominator,
+      percent,
+      submittedAt: attempt.submittedAt
+    });
     const answers = new Map(attempt.answers.map((answer) => [answer.questionId, answer]));
     for (const questionId of questionOrder) {
       const question = questionById.get(questionId);
@@ -690,6 +725,19 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
       const topicId = snapshot?.topicId ?? question.topic.id;
       const topicTitle = snapshot?.topicTitle ?? question.topic.title;
       const isCorrect = selected.length === correctIds.length && correctIds.every((id) => selected.includes(id));
+      const studentTopicKey = `${attempt.user.id}:${topicId}`;
+      const studentTopic = studentTopics.get(studentTopicKey) ?? {
+        studentId: attempt.user.id,
+        studentName: attempt.user.displayName,
+        username: attempt.user.username,
+        topicId,
+        topicTitle,
+        correct: 0,
+        total: 0
+      };
+      studentTopic.total += 1;
+      if (isCorrect) studentTopic.correct += 1;
+      studentTopics.set(studentTopicKey, studentTopic);
       const item = itemAnalysis.get(questionId) ?? {
         questionId,
         stem: snapshot?.stem ?? question.stem,
@@ -721,6 +769,12 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
     }
   }
   return {
+    studentScores: studentScores.sort((left, right) =>
+      (right.submittedAt?.getTime() ?? 0) - (left.submittedAt?.getTime() ?? 0) || left.studentName.localeCompare(right.studentName)
+    ),
+    studentTopics: [...studentTopics.values()]
+      .map((topic) => ({ ...topic, accuracy: Math.round((topic.correct / topic.total) * 100) }))
+      .sort((left, right) => left.studentName.localeCompare(right.studentName) || left.topicTitle.localeCompare(right.topicTitle)),
     leaderboard: [...leaderboard.values()]
       .map(({ totalPercent, classes, ...student }) => ({
         ...student,

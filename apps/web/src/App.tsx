@@ -127,7 +127,7 @@ function App() {
     <Shell user={user} branding={branding} page={page} onPage={setPage} onLogout={() => void logout()}>
       {user.role === "ADMIN"
         ? <AdminPage page={page} branding={branding} onNavigate={setPage} onBrandingSaved={(next) => queryClient.setQueryData(["branding"], next)} reportedQuestionId={reportedQuestionId} onQuestionEditOpened={clearReportedQuestion} onRequestQuestionEdit={openReportedQuestion} />
-        : <StudentPage user={user} />}
+        : <StudentPage user={user} page={page} onNavigate={setPage} />}
     </Shell>
   );
 }
@@ -236,7 +236,11 @@ function Shell({ user, branding, page, onPage, onLogout, children }: {
   const [menuOpen, setMenuOpen] = useState(false);
   const navigation = user.role === "ADMIN"
     ? adminNavigation
-    : [{ id: "overview" as Page, label: "My learning", icon: BookOpen }, { id: "exams" as Page, label: "Exams", icon: Boxes }];
+    : [
+      { id: "overview" as Page, label: "My learning", icon: BookOpen },
+      { id: "lessons" as Page, label: "Lessons", icon: BookOpen },
+      { id: "exams" as Page, label: "Exams", icon: Boxes }
+    ];
   return <div className="app-shell">
     <aside className={`sidebar ${menuOpen ? "sidebar-open" : ""}`}>
       <Brand branding={branding} compact />
@@ -975,50 +979,103 @@ type QuestionIssueRecord = {
 };
 
 type AdminAnalyticsData = {
+  studentScores: Array<{ id: string; studentId: string; studentName: string; username: string; classes: string[]; classIds: string[]; examTitle: string; attemptNumber: number; score: number; maximumScore: number; percent: number; submittedAt: string | null }>;
+  studentTopics: Array<{ studentId: string; studentName: string; username: string; classId: string; className: string; topicId: string; topicTitle: string; correct: number; total: number; accuracy: number }>;
   leaderboard: Array<{ id: string; username: string; displayName: string; attempts: number; latestSubmittedAt: string | null; averagePercent: number; classes: string[] }>;
   heatmap: Array<{ classId: string; className: string; topicId: string; topicTitle: string; correct: number; total: number; accuracy: number }>;
-  itemAnalysis: Array<{ questionId: string; stem: string; topicTitle: string; attempts: number; correct: number; accuracy: number; optionSelections: Record<string, number>; optionLabels: Record<string, string> }>;
+  itemAnalysis: Array<{ questionId: string; classId: string; className: string; stem: string; topicTitle: string; attempts: number; correct: number; accuracy: number; optionSelections: Record<string, number>; optionLabels: Record<string, string> }>;
   auditLog: Array<{ id: string; action: string; entityType: string; entityId: string | null; details: string; createdAt: string; actor: { username: string; displayName: string } | null }>;
 };
 
 function AnalyticsPage() {
   const analytics = useQuery({ queryKey: ["admin-analytics"], queryFn: () => api<AdminAnalyticsData>("/api/admin/analytics") });
+  const [selectedClassId, setSelectedClassId] = useState("");
+  const [selectedStudentId, setSelectedStudentId] = useState("");
+  const classOptions = [...new Map((analytics.data?.heatmap ?? []).map((cell) => [cell.classId, { id: cell.classId, name: cell.className }])).values()];
+  const classScores = (analytics.data?.studentScores ?? []).filter((result) =>
+    !selectedClassId || (selectedClassId === "__unassigned__" ? result.classIds.length === 0 : result.classIds.includes(selectedClassId))
+  );
+  const studentOptions = [...new Map(classScores.map((result) => [result.studentId, { id: result.studentId, name: result.studentName, username: result.username }])).values()];
+  const studentScores = classScores.filter((result) => !selectedStudentId || result.studentId === selectedStudentId);
+  const studentTopics = (analytics.data?.studentTopics ?? []).filter((topic) =>
+    (!selectedClassId || (selectedClassId === "__unassigned__" ? !topic.classId : topic.classId === selectedClassId)) && (!selectedStudentId || topic.studentId === selectedStudentId)
+  );
+  const heatmap = (analytics.data?.heatmap ?? []).filter((cell) =>
+    !selectedClassId || (selectedClassId === "__unassigned__" ? !cell.classId : cell.classId === selectedClassId)
+  );
+  const itemAnalysis = (analytics.data?.itemAnalysis ?? []).filter((item) =>
+    !selectedClassId || (selectedClassId === "__unassigned__" ? !item.classId : item.classId === selectedClassId)
+  );
+  const leaderboard = [...new Set(classScores.map((result) => result.studentId))]
+    .map((studentId) => {
+      const scores = classScores.filter((result) => result.studentId === studentId);
+      const latest = scores[0]!;
+      return {
+        id: studentId,
+        username: latest.username,
+        displayName: latest.studentName,
+        attempts: scores.length,
+        averagePercent: Number((scores.reduce((total, result) => total + result.percent, 0) / scores.length).toFixed(2)),
+        classes: [...new Set(scores.flatMap((result) => result.classes))],
+        latestSubmittedAt: latest.submittedAt
+      };
+    })
+    .filter((student) => !selectedStudentId || student.id === selectedStudentId)
+    .sort((left, right) => right.averagePercent - left.averagePercent || left.displayName.localeCompare(right.displayName));
   const downloadCsv = () => {
     if (!analytics.data) return;
-    const csv = Papa.unparse(analytics.data.leaderboard.map((student, index) => ({
-      rank: index + 1,
-      student: student.displayName,
-      username: student.username,
-      classes: student.classes.join(", "),
-      gradedAttempts: student.attempts,
-      averageScorePercent: student.averagePercent,
-      latestSubmission: student.latestSubmittedAt ?? ""
+    const csv = Papa.unparse(studentScores.map((result) => ({
+      student: result.studentName,
+      username: result.username,
+      classes: result.classes.join(", "),
+      exam: result.examTitle,
+      attempt: result.attemptNumber,
+      score: result.score,
+      maximumScore: result.maximumScore,
+      percentage: result.percent.toFixed(2),
+      submittedAt: result.submittedAt ?? ""
     })));
     const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "chemarena-student-report-cards.csv";
+    anchor.download = "chemarena-student-exam-scores.csv";
     anchor.click();
     URL.revokeObjectURL(url);
   };
   return <div className="page-stack">
-    <PageHeader eyebrow="PHASE 4 · ANALYTICS" title="Learning analytics" description="Review student outcomes, topic coverage, question performance and recent administrative activity." action={<div className="action-cell"><button className="button button-outline" onClick={downloadCsv} disabled={!analytics.data?.leaderboard.length}>Download CSV</button><button className="button button-primary" onClick={() => window.print()} disabled={!analytics.data?.leaderboard.length}>Print / Save PDF</button></div>} />
+    <PageHeader eyebrow="PHASE 4 · ANALYTICS" title="Learning analytics" description="Review student outcomes, topic coverage, question performance and recent administrative activity." action={<div className="action-cell"><button className="button button-outline" onClick={downloadCsv} disabled={!studentScores.length}>Download CSV</button><button className="button button-primary" onClick={() => window.print()} disabled={!studentScores.length}>Print / Save PDF</button></div>} />
     {analytics.error && <ErrorNotice message={(analytics.error as Error).message} />}
     <section className="card table-card">
       <div className="table-title"><h2>Student report cards</h2><span className="muted">Ranked by average percentage across graded attempts</span></div>
-      <div className="analytics-report-cards">{analytics.data?.leaderboard.map((student, index) => <article className="analytics-report-card" key={student.id}>
+      <div className="table-title"><h2>Student report cards</h2><span className="muted">Ranked by average percentage across graded attempts</span></div>
+      <div className="analytics-report-cards">{leaderboard.map((student, index) => <article className="analytics-report-card" key={student.id}>
         <span className="eyebrow">RANK {index + 1}</span><h3>{student.displayName}</h3><p><code>{student.username}</code> · {student.classes.join(", ") || "No class"}</p>
-        <strong>{student.averagePercent}%</strong><small>{student.attempts} graded attempt{student.attempts === 1 ? "" : "s"} · Latest: {student.latestSubmittedAt ? new Date(student.latestSubmittedAt).toLocaleDateString() : "—"}</small>
+        <strong>{student.averagePercent.toFixed(2)}%</strong><small>{student.attempts} graded attempt{student.attempts === 1 ? "" : "s"} · Latest: {student.latestSubmittedAt ? new Date(student.latestSubmittedAt).toLocaleDateString() : "—"}</small>
       </article>)}</div>
-      {!analytics.data?.leaderboard.length && <p className="muted">{analytics.isLoading ? "Calculating results…" : "Graded attempts will appear here."}</p>}
+      {!leaderboard.length && <p className="muted">{analytics.isLoading ? "Calculating results…" : "Graded attempts will appear here."}</p>}
     </section>
-    <section className="card table-card"><div className="table-title"><h2>Class-by-topic performance</h2></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Syllabus topic</th><th>Correct</th><th>Accuracy</th></tr></thead><tbody>
-      {analytics.data?.heatmap.map((cell) => <tr key={`${cell.classId}:${cell.topicId}`}><td>{cell.className}</td><td>{cell.topicTitle}</td><td>{cell.correct} / {cell.total}</td><td><span className={`heat-cell ${cell.accuracy >= 80 ? "heat-high" : cell.accuracy >= 50 ? "heat-mid" : "heat-low"}`}>{cell.accuracy}%</span></td></tr>)}
-      {!analytics.data?.heatmap.length && <EmptyRow columns={4} text={analytics.isLoading ? "Loading topic results…" : "Class topic results will appear after graded exams."} />}
+    <section className="card table-card">
+      <div className="table-title"><div><h2>Individual exam scores</h2><span className="muted">One row per graded attempt, newest first</span></div><div className="analytics-filters">
+        <label>Class<select value={selectedClassId} onChange={(event) => { setSelectedClassId(event.target.value); setSelectedStudentId(""); }}><option value="">All classes</option>{classOptions.map((record) => <option key={record.id || "__unassigned__"} value={record.id || "__unassigned__"}>{record.name}</option>)}</select></label>
+        <label>Student<select value={selectedStudentId} onChange={(event) => setSelectedStudentId(event.target.value)}><option value="">All students</option>{studentOptions.map((student) => <option key={student.id} value={student.id}>{student.name} ({student.username})</option>)}</select></label>
+      </div>
+      </div>
+      <div className="table-wrap"><table><thead><tr><th>Student</th><th>Username</th><th>Class</th><th>Exam</th><th>Attempt</th><th>Score</th><th>Percentage</th><th>Submitted</th></tr></thead><tbody>
+        {studentScores.map((result) => <tr key={result.id}><td className="strong-cell">{result.studentName}</td><td>{result.username}</td><td>{result.classes.join(", ") || "—"}</td><td>{result.examTitle}</td><td>#{result.attemptNumber}</td><td>{result.score} / {result.maximumScore}</td><td><span className={`heat-cell ${result.percent >= 80 ? "heat-high" : result.percent >= 50 ? "heat-mid" : "heat-low"}`}>{result.percent.toFixed(2)}%</span></td><td>{result.submittedAt ? new Date(result.submittedAt).toLocaleString() : "—"}</td></tr>)}
+        {!studentScores.length && <EmptyRow columns={8} text={analytics.isLoading ? "Loading student scores…" : "Graded exam scores will appear here."} />}
+      </tbody></table></div>
+    </section>
+    <section className="card table-card"><div className="table-title"><div><h2>Student-by-topic performance</h2><span className="muted">Accuracy across each student's graded answers</span></div></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Student</th><th>Username</th><th>Syllabus topic</th><th>Correct</th><th>Accuracy</th></tr></thead><tbody>
+      {studentTopics.map((topic) => <tr key={`${topic.classId}:${topic.studentId}:${topic.topicId}`}><td>{topic.className}</td><td className="strong-cell">{topic.studentName}</td><td>{topic.username}</td><td>{topic.topicTitle}</td><td>{topic.correct} / {topic.total}</td><td><span className={`heat-cell ${topic.accuracy >= 80 ? "heat-high" : topic.accuracy >= 50 ? "heat-mid" : "heat-low"}`}>{topic.accuracy.toFixed(2)}%</span></td></tr>)}
+      {!studentTopics.length && <EmptyRow columns={6} text={analytics.isLoading ? "Loading student topic results…" : "Student topic results will appear after graded exams."} />}
     </tbody></table></div></section>
-    <section className="card table-card"><div className="table-title"><h2>Question item analysis</h2><span className="muted">Accuracy across submitted answers</span></div><div className="table-wrap"><table><thead><tr><th>Question</th><th>Topic</th><th>Attempts</th><th>Correct</th><th>Accuracy</th><th>Option selections</th></tr></thead><tbody>
-      {analytics.data?.itemAnalysis.map((item) => <tr key={item.questionId}><td className="strong-cell">{item.stem}</td><td>{item.topicTitle}</td><td>{item.attempts}</td><td>{item.correct}</td><td>{item.accuracy}%</td><td>{Object.entries(item.optionSelections).map(([optionId, count]) => `${optionId.toUpperCase()} (${item.optionLabels[optionId] ?? optionId}): ${count}`).join(" · ") || "—"}</td></tr>)}
-      {!analytics.data?.itemAnalysis.length && <EmptyRow columns={6} text={analytics.isLoading ? "Analyzing questions…" : "Question analysis will appear after graded exams."} />}
+    <section className="card table-card"><div className="table-title"><div><h2>Class-by-topic performance</h2><span className="muted">Combined accuracy across students in each class</span></div></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Syllabus topic</th><th>Correct</th><th>Accuracy</th></tr></thead><tbody>
+      {heatmap.map((cell) => <tr key={`${cell.classId}:${cell.topicId}`}><td>{cell.className}</td><td>{cell.topicTitle}</td><td>{cell.correct} / {cell.total}</td><td><span className={`heat-cell ${cell.accuracy >= 80 ? "heat-high" : cell.accuracy >= 50 ? "heat-mid" : "heat-low"}`}>{cell.accuracy.toFixed(2)}%</span></td></tr>)}
+      {!heatmap.length && <EmptyRow columns={4} text={analytics.isLoading ? "Loading topic results…" : "Class topic results will appear after graded exams."} />}
+    </tbody></table></div></section>
+    <section className="card table-card"><div className="table-title"><h2>Question item analysis</h2><span className="muted">Accuracy across submitted answers</span></div><div className="table-wrap"><table><thead><tr><th>Class</th><th>Question</th><th>Topic</th><th>Attempts</th><th>Correct</th><th>Accuracy</th><th>Option selections</th></tr></thead><tbody>
+      {itemAnalysis.map((item) => <tr key={`${item.classId}:${item.questionId}`}><td>{item.className}</td><td className="strong-cell">{item.stem}</td><td>{item.topicTitle}</td><td>{item.attempts}</td><td>{item.correct}</td><td>{item.accuracy.toFixed(2)}%</td><td>{Object.entries(item.optionSelections).map(([optionId, count]) => `${optionId.toUpperCase()} (${item.optionLabels[optionId] ?? optionId}): ${count}`).join(" · ") || "—"}</td></tr>)}
+      {!itemAnalysis.length && <EmptyRow columns={7} text={analytics.isLoading ? "Analyzing questions…" : "Question analysis will appear after graded exams."} />}
     </tbody></table></div></section>
     <section className="card table-card"><div className="table-title"><h2>Recent audit activity</h2><span className="muted">Latest 100 events</span></div><div className="table-wrap"><table><thead><tr><th>Time</th><th>Administrator</th><th>Action</th><th>Record</th><th>Details</th></tr></thead><tbody>
       {analytics.data?.auditLog.map((event) => <tr key={event.id}><td>{new Date(event.createdAt).toLocaleString()}</td><td>{event.actor?.displayName ?? "System"}</td><td>{event.action}</td><td>{event.entityType}{event.entityId ? ` · ${event.entityId}` : ""}</td><td><code>{event.details}</code></td></tr>)}
@@ -1064,7 +1121,7 @@ function QuestionReportsPage({ onEditQuestion }: { onEditQuestion: (id: string) 
             {issue.status !== "OPEN" && <button className="button button-outline button-small" disabled={updateStatus.isPending} onClick={() => updateStatus.mutate({ id: issue.id, status: "OPEN" })}>Reopen</button>}
           </td>
         </tr>)}
-        {!issues.data?.length && <EmptyRow columns={5} text={issues.isLoading ? "Loading reports…" : "No reports in this view."} />}
+        {!issues.data?.length && <EmptyRow columns={5} text={issues.isLoading ? "Loading reports…" : statusFilter === "OPEN" ? "No open reports. A student's private exam flag is not sent to the teacher; they must use Report question." : "No reports in this view."} />}
       </tbody></table></div>
     </section>
   </div>;
@@ -1239,7 +1296,7 @@ function ExamBuilder({ questions, topics, classes, onCancel, onCreate, busy }: {
   </section>;
 }
 
-function StudentPage({ user }: { user: User }) {
+function StudentPage({ user, page, onNavigate }: { user: User; page: Page; onNavigate: (page: Page) => void }) {
   useEffect(() => {
     const heartbeat = () => void api("/api/auth/heartbeat", { method: "POST", body: "{}" }).catch(() => undefined);
     heartbeat();
@@ -1303,14 +1360,13 @@ function StudentPage({ user }: { user: User }) {
     void results.refetch();
     void exams.refetch();
   }} />;
-  return <div className="page-stack"><PageHeader eyebrow="YOUR LEARNING" title="Welcome to ChemArena" description="Practise organic chemistry and prepare for your next computer-based test." />
-    <StudentAnalyticsPanel onPracticeStart={(examId) => start.mutate(examId)} />
+  if (page === "lessons") return <StudentLessonsPage />;
+  if (page === "exams") return <div className="page-stack"><PageHeader eyebrow="YOUR ASSESSMENTS" title="Exams" description="View available exams and continue an assigned assessment." />
     {startError && <ErrorNotice message={startError} />}
-    {review.data && <section className="card review-card"><div className="table-title"><div><span className="eyebrow">ANSWER REVIEW</span><h2>{review.data.examTitle} · Score {review.data.score}</h2></div><button className="icon-button" onClick={() => setReviewId("")}><X /></button></div>
+    {review.data && <section className="card review-card"><div className="table-title"><div><span className="eyebrow">ANSWER REVIEW</span><h2>{review.data.examTitle} · Score {review.data.score}</h2></div><button className="icon-button" aria-label="Close answer review" onClick={() => setReviewId("")}><X /></button></div>
       {review.data.questions.map((question, index) => <article key={question.id} className="review-question"><strong>{index + 1}. {question.stem}</strong><div className="option-preview">{question.options.map((option) => <span className={question.correctOptionIds.includes(option.id) ? "option-correct" : question.selectedOptionIds.includes(option.id) ? "option-wrong" : ""} key={option.id}><i>{option.id.toUpperCase()}</i>{option.text}</span>)}</div><p>{question.explanation}</p></article>)}
     </section>}
     {review.isError && <ErrorNotice message={(review.error as Error).message} />}
-    <StudentLessonsPage />
     <section className="card table-card"><div className="table-title"><h2>Available exams</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Duration</th><th>Availability</th><th>Attempts</th><th>Action</th></tr></thead><tbody>
       {exams.data?.map((exam) => {
         const completedWithoutRetake = exam.attemptsTaken > 0 && exam.latestAttemptStatus !== "IN_PROGRESS" && exam.retakesRemaining === 0;
@@ -1318,7 +1374,10 @@ function StudentPage({ user }: { user: User }) {
       })}
       {!exams.data?.length && <EmptyRow columns={5} text={exams.isLoading ? "Loading exams…" : "No exams are currently available."} />}
     </tbody></table></div></section>
-    <section className="card table-card"><div className="table-title"><h2>My results</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Attempt</th><th>Score</th><th>Submitted</th><th>Review</th></tr></thead><tbody>
+  </div>;
+  return <div className="page-stack"><PageHeader eyebrow="YOUR LEARNING" title="My learning" description="Track your exam results and progress by topic." />
+    <StudentAnalyticsPanel onPracticeStart={(examId) => start.mutate(examId)} />
+    <section className="card table-card"><div className="table-title"><h2>My results</h2><button className="button button-outline button-small" onClick={() => onNavigate("exams")}>View exams</button></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Attempt</th><th>Score</th><th>Submitted</th><th>Review</th></tr></thead><tbody>
       {results.data?.map((result) => <tr key={result.id}><td className="strong-cell">{result.exam.title}</td><td>#{result.attemptNumber}</td><td>{result.score ?? "—"}</td><td>{result.submittedAt ? new Date(result.submittedAt).toLocaleString() : "—"}</td><td><button className="button button-outline button-small" onClick={() => setReviewId(result.id)}>Review answers</button></td></tr>)}
       {!results.data?.length && <EmptyRow columns={5} text={results.isLoading ? "Loading results…" : "Your graded results will appear here."} />}
     </tbody></table></div></section>
@@ -1636,7 +1695,7 @@ function CBTPlayer({ cachedAttempt, onExit }: { cachedAttempt: CachedExamAttempt
       <label>Details (optional)<textarea value={reportNote} onChange={(event) => setReportNote(event.target.value)} maxLength={1000} rows={3} /></label>
       <div className="editor-actions"><button type="button" className="button button-outline" onClick={() => { setReportOpen(false); setReportError(""); }}>Cancel</button><button className="button button-primary" disabled={reportIssue.isPending || isFrozen}>{reportIssue.isPending ? "Sending…" : "Send report"}</button></div>
     </form>}
-    <div className="cbt-layout"><main className="cbt-question-area"><div className="cbt-question-top"><span>QUESTION {current + 1} <span className="muted">OF {examPackage.questions.length}</span></span><div><button className={`button button-small ${flags.includes(currentQuestion.id) ? "button-flag-active" : "button-outline"}`} onClick={() => toggleFlag(currentQuestion.id)}>{flags.includes(currentQuestion.id) ? "★ Flagged" : "☆ Flag for review"}</button><button className="button button-outline button-small" onClick={() => { setReportOpen(true); setReportMessage(""); setReportError(""); }} disabled={isFrozen}>Report question</button></div></div>
+    <div className="cbt-layout"><main className="cbt-question-area"><div className="cbt-question-top"><span>QUESTION {current + 1} <span className="muted">OF {examPackage.questions.length}</span></span><div><button className={`button button-small ${flags.includes(currentQuestion.id) ? "button-flag-active" : "button-outline"}`} aria-pressed={flags.includes(currentQuestion.id)} title="Private marker for your own review. Use Report question to notify your teacher." onClick={() => toggleFlag(currentQuestion.id)}>{flags.includes(currentQuestion.id) ? "★ Flagged" : "☆ Flag for review"}</button><button className="button button-outline button-small" title="Send this question to your teacher for review." onClick={() => { setReportOpen(true); setReportMessage(""); setReportError(""); }} disabled={isFrozen}>Report question</button></div></div>
       <article className="cbt-question"><h2>{currentQuestion.stem}</h2>{currentQuestion.smiles && <SmilesPreview smiles={currentQuestion.smiles} />}{currentQuestion.imageDataUrl && <img className="question-image" src={currentQuestion.imageDataUrl} alt="Question structure" />}
         <div className="cbt-options">{currentQuestion.options.map((option, index) => <button key={option.id} disabled={isFrozen} className={`cbt-option ${(answers[currentQuestion.id] ?? []).includes(option.id) ? "cbt-option-selected" : ""}`} onClick={() => selectOption(currentQuestion.id, option.id)}><span className="cbt-option-letter">{String.fromCharCode(65 + index)}</span><span>{option.text}</span><i>{(answers[currentQuestion.id] ?? []).includes(option.id) ? "✓" : ""}</i></button>)}</div>
       </article>
