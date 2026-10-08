@@ -680,6 +680,26 @@ app.patch("/api/admin/students/:id/status", { preHandler: [requireCsrf, requireA
   return publicUser(student);
 });
 
+app.delete("/api/admin/students/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const student = await prisma.user.findFirst({
+    where: { id, role: Role.STUDENT },
+    select: { id: true, username: true, displayName: true }
+  });
+  if (!student) return reply.code(404).send({ error: "Student not found." });
+  const deletedAttempts = await prisma.examAttempt.count({ where: { userId: id } });
+  await prisma.$transaction(async (transaction) => {
+    await transaction.examAttempt.deleteMany({ where: { userId: id } });
+    await transaction.user.delete({ where: { id, role: Role.STUDENT } });
+  });
+  await audit(request.auth!.userId, "student.permanently_deleted", "User", id, {
+    username: student.username,
+    displayName: student.displayName,
+    deletedAttempts
+  });
+  return { ok: true, deletedAttempts };
+});
+
 app.post("/api/admin/students/:id/reset-password", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const { id } = request.params as { id: string };
   const temporaryPassword = randomBytes(6).toString("base64url").slice(0, 8);
@@ -1195,6 +1215,56 @@ app.get("/api/admin/exams", { preHandler: requireAdmin }, async () =>
   })
 );
 
+app.post("/api/admin/exams/:examId/students/:userId/retakes", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { examId, userId } = request.params as { examId: string; userId: string };
+  const [exam, student] = await Promise.all([
+    prisma.exam.findUnique({ where: { id: examId }, include: { classes: { select: { classId: true } }, students: { select: { userId: true } } } }),
+    prisma.user.findFirst({ where: { id: userId, role: Role.STUDENT, status: RecordStatus.ACTIVE }, select: { id: true } })
+  ]);
+  if (!exam || !student) return reply.code(404).send({ error: "Exam or active student not found." });
+  if (exam.status !== "SCHEDULED" && exam.status !== "ACTIVE") {
+    return reply.code(409).send({ error: "Retakes can only be granted while the exam is scheduled or active." });
+  }
+  if (exam.closesAt && exam.closesAt < new Date()) {
+    return reply.code(409).send({ error: "This exam's availability window has ended." });
+  }
+  const enrollments = await prisma.enrollment.findMany({ where: { userId }, select: { classId: true } });
+  const assigned = exam.students.some((record) => record.userId === userId)
+    || exam.classes.some(({ classId }) => enrollments.some((enrollment) => enrollment.classId === classId));
+  if (!assigned) return reply.code(400).send({ error: "This student is not assigned to the exam." });
+  if (!(await prisma.examAttempt.count({ where: { examId, userId } }))) {
+    return reply.code(409).send({ error: "A student must complete an attempt before a rewrite can be granted." });
+  }
+  if (await prisma.examAttempt.findFirst({ where: { examId, userId, status: "IN_PROGRESS" } })) {
+    return reply.code(409).send({ error: "This student already has an in-progress attempt." });
+  }
+  const grant = await prisma.examRetakeGrant.upsert({
+    where: { examId_userId: { examId, userId } },
+    create: { examId, userId, remainingAttempts: 1 },
+    update: { remainingAttempts: { increment: 1 } }
+  });
+  await audit(request.auth!.userId, "exam_retake.granted", "Exam", examId, { userId, remainingAttempts: grant.remainingAttempts });
+  return { remainingAttempts: grant.remainingAttempts };
+});
+
+app.delete("/api/admin/exams/:id", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { id } = request.params as { id: string };
+  const exam = await prisma.exam.findUnique({
+    where: { id },
+    select: { id: true, title: true, _count: { select: { attempts: true } } }
+  });
+  if (!exam) return reply.code(404).send({ error: "Exam not found." });
+  await prisma.$transaction(async (transaction) => {
+    await transaction.examAttempt.deleteMany({ where: { examId: id } });
+    await transaction.exam.delete({ where: { id } });
+  });
+  await audit(request.auth!.userId, "exam.permanently_deleted", "Exam", id, {
+    title: exam.title,
+    deletedAttempts: exam._count.attempts
+  });
+  return { ok: true, deletedAttempts: exam._count.attempts };
+});
+
 app.patch("/api/admin/exams/:id/status", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const { id } = request.params as { id: string };
   const body = request.body as { status?: unknown };
@@ -1233,15 +1303,19 @@ app.get("/api/admin/exams/:id/monitor", { preHandler: requireAdmin }, async (req
   assignedRows.forEach((user) => assignedUsers.set(user.id, user));
   const userIds = [...assignedUsers.keys()];
   const now = Date.now();
-  const [attempts, sessions] = await Promise.all([
+  const [attempts, sessions, retakeGrants] = await Promise.all([
     prisma.examAttempt.findMany({
       where: { examId: id },
       include: { _count: { select: { answers: true } } },
-      orderBy: { startedAt: "asc" }
+      orderBy: { attemptNumber: "asc" }
     }),
-    prisma.session.findMany({ where: { userId: { in: userIds }, expiresAt: { gt: new Date() } }, select: { userId: true, lastSeenAt: true } })
+    prisma.session.findMany({ where: { userId: { in: userIds }, expiresAt: { gt: new Date() } }, select: { userId: true, lastSeenAt: true } }),
+    prisma.examRetakeGrant.findMany({ where: { examId: id, userId: { in: userIds } }, select: { userId: true, remainingAttempts: true } })
   ]);
   const attemptByUser = new Map(attempts.map((attempt) => [attempt.userId, attempt]));
+  const attemptCountByUser = new Map<string, number>();
+  attempts.forEach((attempt) => attemptCountByUser.set(attempt.userId, (attemptCountByUser.get(attempt.userId) ?? 0) + 1));
+  const retakesByUser = new Map(retakeGrants.map((grant) => [grant.userId, grant.remainingAttempts]));
   const recentSessions = new Set(sessions.filter((session) => now - session.lastSeenAt.getTime() < 45_000).map(({ userId }) => userId));
   return [...assignedUsers.values()].map((user) => {
     const attempt = attemptByUser.get(user.id);
@@ -1250,6 +1324,9 @@ app.get("/api/admin/exams/:id/monitor", { preHandler: requireAdmin }, async (req
       id: attempt?.id ?? null,
       user,
       status: attempt?.status ?? "NOT_STARTED",
+      attemptNumber: attempt?.attemptNumber ?? null,
+      attemptsTaken: attemptCountByUser.get(user.id) ?? 0,
+      retakesRemaining: retakesByUser.get(user.id) ?? 0,
       joined: recentSessions.has(user.id) || (active && now - attempt.lastSeenAt.getTime() < 45_000),
       startedAt: attempt?.startedAt ?? null,
       deadline: attempt?.deadline ?? null,
@@ -1391,14 +1468,36 @@ app.get("/api/student/exams", { preHandler: requireStudent }, async (request: Au
   const enrollments = await prisma.enrollment.findMany({ where: { userId: request.auth!.userId }, select: { classId: true } });
   const classIds = enrollments.map(({ classId }) => classId);
   const now = new Date();
-  return prisma.exam.findMany({
+  const exams = await prisma.exam.findMany({
     where: {
       status: { in: ["SCHEDULED", "ACTIVE"] },
       AND: [{ OR: [{ opensAt: null }, { opensAt: { lte: now } }] }, { OR: [{ closesAt: null }, { closesAt: { gte: now } }] }],
       OR: [{ classes: { some: { classId: { in: classIds } } } }, { students: { some: { userId: request.auth!.userId } } }]
     },
-    select: { id: true, title: true, description: true, durationMinutes: true, opensAt: true, closesAt: true }
+    include: {
+      attempts: {
+        where: { userId: request.auth!.userId },
+        orderBy: { attemptNumber: "desc" },
+        select: { status: true, attemptNumber: true }
+      },
+      retakeGrants: {
+        where: { userId: request.auth!.userId },
+        select: { remainingAttempts: true }
+      }
+    }
   });
+  return exams.map(({ attempts, retakeGrants, ...exam }) => ({
+    id: exam.id,
+    title: exam.title,
+    description: exam.description,
+    durationMinutes: exam.durationMinutes,
+    opensAt: exam.opensAt,
+    closesAt: exam.closesAt,
+    attemptsTaken: attempts.length,
+    latestAttemptStatus: attempts[0]?.status ?? null,
+    latestAttemptNumber: attempts[0]?.attemptNumber ?? null,
+    retakesRemaining: retakeGrants[0]?.remainingAttempts ?? 0
+  }));
 });
 
 app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStudent] }, async (request: AuthenticatedRequest, reply) => {
@@ -1416,8 +1515,10 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
   if ((exam.opensAt && now < exam.opensAt) || (exam.closesAt && now > exam.closesAt)) {
     return reply.code(403).send({ error: "This exam is outside its availability window." });
   }
-  let attempt = await prisma.examAttempt.findUnique({ where: { examId_userId: { examId: id, userId: request.auth!.userId } } });
-  if (attempt && attempt.status !== "IN_PROGRESS") return reply.code(409).send({ error: "This exam attempt has already been submitted." });
+  let attempt = await prisma.examAttempt.findFirst({
+    where: { examId: id, userId: request.auth!.userId, status: "IN_PROGRESS" },
+    orderBy: { attemptNumber: "desc" }
+  });
   let selectedQuestions = exam.items.map(({ question }) => question);
   if (!selectedQuestions.length) {
     const rules = JSON.parse(exam.selectionRules) as {
@@ -1446,6 +1547,7 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
     if (selectedQuestions.length !== exam.questionCount) return reply.code(409).send({ error: "Exam rules did not select the required number of questions." });
     await prisma.exam.update({ where: { id }, data: { items: { create: selectedQuestions.map((question, position) => ({ questionId: question.id, position })) } } });
   }
+  let startedNewAttempt = false;
   if (!attempt) {
     const ordered = exam.shuffleQuestions ? shuffleArray(selectedQuestions) : selectedQuestions;
     const questionOrder = ordered.map(({ id: questionId }) => questionId);
@@ -1453,17 +1555,50 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
       const options = JSON.parse(question.options) as Array<{ id: string; text: string }>;
       return [question.id, (exam.shuffleOptions ? shuffleArray(options) : options).map((option) => option.id)];
     }));
-    attempt = await prisma.examAttempt.create({
-      data: {
-        examId: id,
-        userId: request.auth!.userId,
-        deadline: new Date(now.getTime() + exam.durationMinutes * 60_000),
-        questionOrder: JSON.stringify(questionOrder),
-        optionOrders: JSON.stringify(optionOrders)
+    try {
+      const result = await prisma.$transaction(async (transaction) => {
+        const alreadyStarted = await transaction.examAttempt.findFirst({
+          where: { examId: id, userId: request.auth!.userId, status: "IN_PROGRESS" },
+          orderBy: { attemptNumber: "desc" }
+        });
+        if (alreadyStarted) return { attempt: alreadyStarted, created: false };
+        const previousAttempts = await transaction.examAttempt.count({ where: { examId: id, userId: request.auth!.userId } });
+        if (previousAttempts > 0) {
+          const consumed = await transaction.examRetakeGrant.updateMany({
+            where: { examId: id, userId: request.auth!.userId, remainingAttempts: { gt: 0 } },
+            data: { remainingAttempts: { decrement: 1 } }
+          });
+          if (!consumed.count) throw new Error("EXAM_RETAKE_NOT_GRANTED");
+        }
+        const created = await transaction.examAttempt.create({
+          data: {
+            examId: id,
+            userId: request.auth!.userId,
+            attemptNumber: previousAttempts + 1,
+            deadline: new Date(now.getTime() + exam.durationMinutes * 60_000),
+            questionOrder: JSON.stringify(questionOrder),
+            optionOrders: JSON.stringify(optionOrders)
+          }
+        });
+        return { attempt: created, created: true };
+      });
+      attempt = result.attempt;
+      startedNewAttempt = result.created;
+    } catch (error) {
+      if (error instanceof Error && error.message === "EXAM_RETAKE_NOT_GRANTED") {
+        return reply.code(403).send({ error: "You have used your attempts for this exam. Ask your teacher to allow a rewrite." });
       }
-    });
-    await prisma.exam.update({ where: { id }, data: { status: "ACTIVE" } });
-    await audit(request.auth!.userId, "exam_attempt.started", "ExamAttempt", attempt.id, { examId: id });
+      throw error;
+    }
+    if (startedNewAttempt) {
+      await prisma.exam.update({ where: { id }, data: { status: "ACTIVE" } });
+      await audit(request.auth!.userId, "exam_attempt.started", "ExamAttempt", attempt.id, {
+        examId: id,
+        attemptNumber: attempt.attemptNumber
+      });
+    } else {
+      await prisma.examAttempt.update({ where: { id: attempt.id }, data: { lastSeenAt: now } });
+    }
   } else {
     await prisma.examAttempt.update({ where: { id: attempt.id }, data: { lastSeenAt: now } });
   }
@@ -1738,7 +1873,7 @@ app.get("/api/student/results/:id/review", { preHandler: requireStudent }, async
 app.get("/api/student/results", { preHandler: requireStudent }, async (request: AuthenticatedRequest) =>
   prisma.examAttempt.findMany({
     where: { userId: request.auth!.userId, status: "GRADED" },
-    select: { id: true, status: true, score: true, submittedAt: true, exam: { select: { title: true } } },
+    select: { id: true, attemptNumber: true, status: true, score: true, submittedAt: true, exam: { select: { title: true } } },
     orderBy: { submittedAt: "desc" }
   })
 );

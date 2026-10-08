@@ -46,22 +46,23 @@ enum AttemptStatus {
 }
 
 model User {
-  id                 String           @id @default(cuid())
-  username           String           @unique
+  id                 String            @id @default(cuid())
+  username           String            @unique
   displayName        String
   passwordHash       String
-  mustChangePassword Boolean          @default(false)
+  mustChangePassword Boolean           @default(false)
   role               Role
-  status             RecordStatus     @default(ACTIVE)
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @updatedAt
+  status             RecordStatus      @default(ACTIVE)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
   enrollments        Enrollment[]
   assignedLessons    LessonStudent[]
   lessonProgress     LessonProgress[]
   assignedExams      ExamStudent[]
   attempts           ExamAttempt[]
+  examRetakeGrants   ExamRetakeGrant[]
   sessions           Session[]
-  auditEvents        AuditLog[]       @relation("AuditActor")
+  auditEvents        AuditLog[]        @relation("AuditActor")
 }
 
 model Session {
@@ -200,26 +201,27 @@ model Question {
 }
 
 model Exam {
-  id               String        @id @default(cuid())
+  id               String            @id @default(cuid())
   title            String
-  description      String        @default("")
+  description      String            @default("")
   durationMinutes  Int
   questionCount    Int
   selectionRules   String
-  shuffleQuestions Boolean       @default(true)
-  shuffleOptions   Boolean       @default(true)
-  marksPerQuestion Float         @default(1)
-  negativeMarking  Boolean       @default(false)
-  negativeMarks    Float         @default(0)
+  shuffleQuestions Boolean           @default(true)
+  shuffleOptions   Boolean           @default(true)
+  marksPerQuestion Float             @default(1)
+  negativeMarking  Boolean           @default(false)
+  negativeMarks    Float             @default(0)
   opensAt          DateTime?
   closesAt         DateTime?
-  status           ExamStatus    @default(DRAFT)
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
+  status           ExamStatus        @default(DRAFT)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
   classes          ExamClass[]
   students         ExamStudent[]
   items            ExamItem[]
   attempts         ExamAttempt[]
+  retakeGrants     ExamRetakeGrant[]
 }
 
 model ExamClass {
@@ -242,6 +244,19 @@ model ExamStudent {
   @@unique([examId, userId])
 }
 
+model ExamRetakeGrant {
+  id                String   @id @default(cuid())
+  examId            String
+  userId            String
+  remainingAttempts Int      @default(0)
+  updatedAt         DateTime @updatedAt
+  exam              Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([examId, userId])
+  @@index([userId])
+}
+
 model ExamItem {
   id         String   @id @default(cuid())
   examId     String
@@ -259,6 +274,7 @@ model ExamAttempt {
   examId        String
   userId        String
   status        AttemptStatus @default(IN_PROGRESS)
+  attemptNumber Int           @default(1)
   startedAt     DateTime      @default(now())
   deadline      DateTime
   submittedAt   DateTime?
@@ -271,7 +287,8 @@ model ExamAttempt {
   answers       Answer[]
   syncEvents    SyncEvent[]
 
-  @@unique([examId, userId])
+  @@unique([examId, userId, attemptNumber])
+  @@index([examId, userId, startedAt])
   @@index([examId, status, lastSeenAt])
 }
 

@@ -356,6 +356,7 @@ function StudentsPage() {
   const [classId, setClassId] = useState("");
   const [credentials, setCredentials] = useState<Array<{ name: string; username: string; password: string }>>([]);
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
   const lan = useQuery({ queryKey: ["lan"], queryFn: () => api<{ joinUrls: string[] }>("/api/admin/lan") });
   const add = useMutation({
     mutationFn: () => api<{ student: User; temporaryPassword: string }>("/api/admin/students", {
@@ -399,9 +400,19 @@ function StudentsPage() {
     mutationFn: (student: StudentRecord) => api<{ student: User; temporaryPassword: string }>(`/api/admin/students/${student.id}/reset-password`, { method: "POST", body: "{}" }),
     onSuccess: ({ student, temporaryPassword }) => setCredentials([{ name: student.displayName, username: student.username, password: temporaryPassword }])
   });
+  const deleteStudent = useMutation({
+    mutationFn: (student: StudentRecord) => api<{ ok: boolean; deletedAttempts: number }>(`/api/admin/students/${student.id}`, { method: "DELETE" }),
+    onSuccess: async ({ deletedAttempts }) => {
+      setError("");
+      setMessage(`Student permanently deleted. ${deletedAttempts} exam attempt${deletedAttempts === 1 ? "" : "s"} and their results were also deleted.`);
+      await client.invalidateQueries({ queryKey: ["students"] });
+      await client.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+    onError: (cause: Error) => { setMessage(""); setError(cause.message); }
+  });
   const printSlip = () => window.print();
   return <div className="page-stack"><PageHeader eyebrow="LEARNER MANAGEMENT" title="Students" description="Issue student accounts, reset passwords and assign classes." action={<button className="button button-outline" onClick={printSlip}><Printer size={16} />Print login slips</button>} />
-    {error && <ErrorNotice message={error} />}
+    {error && <ErrorNotice message={error} />}{message && <div role="status" className="notice notice-success">{message}</div>}
     {credentials.length > 0 && <section className="slip-area" role="status"><div className="slip-toolbar"><strong>{credentials.length} login slip{credentials.length === 1 ? "" : "s"} ready to print</strong><button className="icon-button" aria-label="Dismiss" onClick={() => setCredentials([])}><X size={17} /></button></div>
       <div className="slip-grid">{credentials.map((credential) => <article className="credential-slip" key={credential.username}>
         <div><strong>{credential.name}</strong><p>Username: <code>{credential.username}</code><br />Temporary password: <code>{credential.password}</code></p>
@@ -420,7 +431,7 @@ function StudentsPage() {
     </section>
     <section className="card table-card"><div className="table-title"><h2>Student accounts</h2><span className="muted">{students.data?.length ?? 0} total</span></div>
       <div className="table-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Class</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-        {students.data?.map((student) => <tr key={student.id}><td className="strong-cell">{student.displayName}</td><td><code>{student.username}</code></td><td>{student.enrollments.map((e) => e.class.name).join(", ") || "—"}</td><td><StatusPill status={student.status} /></td><td className="action-cell"><button className="button button-outline button-small" onClick={() => reset.mutate(student)}>Reset password</button><button className="button button-outline button-small" onClick={() => setStatus.mutate(student)}>{student.status === "ACTIVE" ? "Deactivate" : "Activate"}</button></td></tr>)}
+        {students.data?.map((student) => <tr key={student.id}><td className="strong-cell">{student.displayName}</td><td><code>{student.username}</code></td><td>{student.enrollments.map((e) => e.class.name).join(", ") || "—"}</td><td><StatusPill status={student.status} /></td><td className="action-cell"><button className="button button-outline button-small" onClick={() => reset.mutate(student)}>Reset password</button><button className="button button-outline button-small" onClick={() => setStatus.mutate(student)}>{student.status === "ACTIVE" ? "Deactivate" : "Activate"}</button><button className="button button-danger button-small" disabled={deleteStudent.isPending} onClick={() => { if (window.confirm(`Permanently delete ${student.displayName} (${student.username})? This deletes their account, exam attempts, answers, and results. This cannot be undone.`)) deleteStudent.mutate(student); }}>Delete permanently</button></td></tr>)}
         {!students.data?.length && <EmptyRow columns={5} text={students.isLoading ? "Loading students…" : "No student accounts yet."} />}
       </tbody></table></div></section>
   </div>;
@@ -935,6 +946,7 @@ function ExamsPage() {
   const classes = useQuery({ queryKey: ["classes"], queryFn: () => api<ClassRecord[]>("/api/admin/classes") });
   const [selectedExam, setSelectedExam] = useState("");
   const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
   const [showBuilder, setShowBuilder] = useState(false);
   const monitor = useQuery({
     queryKey: ["exam-monitor", selectedExam],
@@ -962,21 +974,44 @@ function ExamsPage() {
     onSuccess: () => void client.invalidateQueries({ queryKey: ["admin-exams"] }),
     onError: (e: Error) => setError(e.message)
   });
+  const allowRetake = useMutation({
+    mutationFn: (attempt: AttemptRecord) => api<{ remainingAttempts: number }>(`/api/admin/exams/${selectedExam}/students/${attempt.user.id}/retakes`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+    onSuccess: ({ remainingAttempts }) => {
+      setError("");
+      setMessage(`Retake allowed. ${remainingAttempts} unused retake${remainingAttempts === 1 ? "" : "s"} remain for this student.`);
+      void client.invalidateQueries({ queryKey: ["exam-monitor", selectedExam] });
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
+  });
+  const deleteExam = useMutation({
+    mutationFn: (exam: ExamRecord) => api<{ ok: boolean; deletedAttempts: number }>(`/api/admin/exams/${exam.id}`, { method: "DELETE" }),
+    onSuccess: async ({ deletedAttempts }) => {
+      setError("");
+      setMessage(`Exam permanently deleted along with ${deletedAttempts} attempt${deletedAttempts === 1 ? "" : "s"} and results.`);
+      setSelectedExam("");
+      await client.invalidateQueries({ queryKey: ["admin-exams"] });
+      await client.invalidateQueries({ queryKey: ["exam-monitor"] });
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
+  });
   const approvedQuestions = questions.data?.filter((question) => question.status === "APPROVED") ?? [];
   return <div className="page-stack"><PageHeader eyebrow="ASSESSMENT" title="Exams" description="Build scheduled computer-based mock exams and monitor student attempts." action={<button className="button button-primary" onClick={() => setShowBuilder(!showBuilder)}><Plus size={16} />{showBuilder ? "Close builder" : "New exam"}</button>} />
-    {error && <ErrorNotice message={error} />}
+    {error && <ErrorNotice message={error} />}{message && <div role="status" className="notice notice-success">{message}</div>}
     {showBuilder && <ExamBuilder questions={approvedQuestions} topics={questions.data?.map((q) => q.topic).filter((topic, index, list) => list.findIndex((item) => item.id === topic.id) === index) ?? []} classes={classes.data?.filter((record) => record.status === "ACTIVE") ?? []} onCancel={() => setShowBuilder(false)} onCreate={(body) => create.mutate(body)} busy={create.isPending} />}
     <section className="card table-card"><div className="table-title"><h2>Exam schedule</h2><span className="muted">{exams.data?.length ?? 0} exams</span></div>
-      <div className="table-wrap"><table><thead><tr><th>Exam</th><th>Questions</th><th>Duration</th><th>Assigned to</th><th>Status</th><th>Monitor</th></tr></thead><tbody>
-        {exams.data?.map((exam) => <tr key={exam.id}><td className="strong-cell">{exam.title}</td><td>{exam.questionCount}</td><td>{exam.durationMinutes} min</td><td>{exam.classes.map(({ class: record }) => record.name).join(", ") || "Individual students"}</td><td><StatusPill status={exam.status} /></td><td className="action-cell"><button className="button button-outline button-small" onClick={() => setSelectedExam(selectedExam === exam.id ? "" : exam.id)}>{selectedExam === exam.id ? "Hide" : "Live monitor"}</button>{exam.status === "SCHEDULED" && <button className="button button-outline button-small" onClick={() => changeExamStatus.mutate({ id: exam.id, status: "CLOSED" })}>Close</button>}</td></tr>)}
+      <div className="table-wrap"><table><thead><tr><th>Exam</th><th>Questions</th><th>Duration</th><th>Assigned to</th><th>Status</th><th>Actions</th></tr></thead><tbody>
+        {exams.data?.map((exam) => <tr key={exam.id}><td className="strong-cell">{exam.title}<small className="table-subtitle">{exam._count.attempts} saved attempt{exam._count.attempts === 1 ? "" : "s"}</small></td><td>{exam.questionCount}</td><td>{exam.durationMinutes} min</td><td>{exam.classes.map(({ class: record }) => record.name).join(", ") || "Individual students"}</td><td><StatusPill status={exam.status} /></td><td className="action-cell"><button className="button button-outline button-small" onClick={() => setSelectedExam(selectedExam === exam.id ? "" : exam.id)}>{selectedExam === exam.id ? "Hide" : "Monitor"}</button>{exam.status === "SCHEDULED" && <button className="button button-outline button-small" onClick={() => changeExamStatus.mutate({ id: exam.id, status: "CLOSED" })}>Close</button>}<button className="button button-danger button-small" disabled={deleteExam.isPending} onClick={() => { if (window.confirm(`Permanently delete "${exam.title}"? This will also permanently delete ${exam._count.attempts} student attempt(s), answers, scores, and results. This cannot be undone.`)) deleteExam.mutate(exam); }}>Delete</button></td></tr>)}
         {!exams.data?.length && <EmptyRow columns={6} text={exams.isLoading ? "Loading exams…" : "No exams yet. Create your first mock exam."} />}
       </tbody></table></div>
     </section>
     {selectedExam && <section className="card table-card monitor-card"><div className="table-title"><div><span className="eyebrow">LIVE EXAM MONITOR</span><h2>Student attempts</h2></div><span className="live-label"><i /> Refreshes every 3 seconds</span></div>
       {monitor.error && <ErrorNotice message={(monitor.error as Error).message} />}
-      <div className="table-wrap"><table><thead><tr><th>Student</th><th>Joined</th><th>Status</th><th>Progress</th><th>Connection</th><th>Deadline</th><th>Actions</th></tr></thead><tbody>
-        {monitor.data?.map((attempt) => <tr key={attempt.user.id}><td className="strong-cell">{attempt.user.displayName}<small className="table-subtitle">{attempt.user.username}</small></td><td>{attempt.joined ? <StatusPill status="ACTIVE" /> : <span className="muted">—</span>}</td><td><StatusPill status={attempt.status} /></td><td>{attempt.answeredCount} / {attempt.questionCount}</td><td><span className={`connection-pill ${attempt.online ? "online" : "offline"}`}><i />{attempt.online ? "Online" : "Offline"}</span></td><td>{attempt.deadline ? new Date(attempt.deadline).toLocaleTimeString() : "—"}</td><td className="action-cell">{attempt.id && attempt.status === "IN_PROGRESS" && <><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "extend" })}>+5 min</button><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "reset" })}>Reset</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Void this exam attempt?")) updateAttempt.mutate({ attempt, action: "void" }); }}>Void</button></>}</td></tr>)}
-        {!monitor.data?.length && <EmptyRow columns={7} text={monitor.isLoading ? "Loading live attempts…" : "No students are assigned to this exam."} />}
+      <div className="table-wrap"><table><thead><tr><th>Student</th><th>Joined</th><th>Status</th><th>Attempts</th><th>Progress</th><th>Connection</th><th>Deadline</th><th>Actions</th></tr></thead><tbody>
+        {monitor.data?.map((attempt) => <tr key={attempt.user.id}><td className="strong-cell">{attempt.user.displayName}<small className="table-subtitle">{attempt.user.username}</small></td><td>{attempt.joined ? <StatusPill status="ACTIVE" /> : <span className="muted">—</span>}</td><td><StatusPill status={attempt.status} /></td><td>{attempt.attemptNumber ? `#${attempt.attemptNumber}` : "—"}{attempt.retakesRemaining > 0 && <small className="table-subtitle">{attempt.retakesRemaining} retake(s) available</small>}</td><td>{attempt.answeredCount} / {attempt.questionCount}</td><td><span className={`connection-pill ${attempt.online ? "online" : "offline"}`}><i />{attempt.online ? "Online" : "Offline"}</span></td><td>{attempt.deadline ? new Date(attempt.deadline).toLocaleTimeString() : "—"}</td><td className="action-cell">{attempt.id && attempt.status === "IN_PROGRESS" && <><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "extend" })}>+5 min</button><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "reset" })}>Reset</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Void this exam attempt?")) updateAttempt.mutate({ attempt, action: "void" }); }}>Void</button></>}{attempt.attemptsTaken > 0 && attempt.status !== "IN_PROGRESS" && <button className="button button-outline button-small" disabled={allowRetake.isPending} onClick={() => { if (window.confirm(`Allow ${attempt.user.displayName} one additional attempt? Their earlier results will be kept.`)) allowRetake.mutate(attempt); }}>Allow rewrite</button>}</td></tr>)}
+        {!monitor.data?.length && <EmptyRow columns={8} text={monitor.isLoading ? "Loading live attempts…" : "No students are assigned to this exam."} />}
       </tbody></table></div>
     </section>}
   </div>;
@@ -989,11 +1024,15 @@ type ExamRecord = {
   durationMinutes: number;
   status: string;
   classes: Array<{ class: { id: string; name: string } }>;
+  _count: { attempts: number };
 };
 type AttemptRecord = {
   id: string | null;
   user: { id: string; displayName: string; username: string };
   status: string;
+  attemptNumber: number | null;
+  attemptsTaken: number;
+  retakesRemaining: number;
   joined: boolean;
   deadline: string | null;
   answeredCount: number;
@@ -1076,8 +1115,11 @@ function StudentPage({ user }: { user: User }) {
     const timer = window.setInterval(heartbeat, 15_000);
     return () => window.clearInterval(timer);
   }, []);
-  const exams = useQuery({ queryKey: ["student-exams"], queryFn: () => api<Array<{ id: string; title: string; description: string; durationMinutes: number; opensAt: string | null; closesAt: string | null }>>("/api/student/exams") });
-  const results = useQuery({ queryKey: ["student-results"], queryFn: () => api<Array<{ id: string; status: string; score: number | null; submittedAt: string | null; exam: { title: string } }>>("/api/student/results") });
+  const exams = useQuery({ queryKey: ["student-exams"], queryFn: () => api<Array<{
+    id: string; title: string; description: string; durationMinutes: number; opensAt: string | null; closesAt: string | null;
+    attemptsTaken: number; latestAttemptStatus: string | null; latestAttemptNumber: number | null; retakesRemaining: number;
+  }>>("/api/student/exams") });
+  const results = useQuery({ queryKey: ["student-results"], queryFn: () => api<Array<{ id: string; attemptNumber: number; status: string; score: number | null; submittedAt: string | null; exam: { title: string } }>>("/api/student/results") });
   const [player, setPlayer] = useState<CachedExamAttempt | null>(null);
   const [reviewId, setReviewId] = useState("");
   const [startError, setStartError] = useState("");
@@ -1137,13 +1179,16 @@ function StudentPage({ user }: { user: User }) {
     </section>}
     {review.isError && <ErrorNotice message={(review.error as Error).message} />}
     <StudentLessonsPage />
-    <section className="card table-card"><div className="table-title"><h2>Available exams</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Duration</th><th>Availability</th><th>Action</th></tr></thead><tbody>
-      {exams.data?.map((exam) => <tr key={exam.id}><td className="strong-cell">{exam.title}<small className="table-subtitle">{exam.description}</small></td><td>{exam.durationMinutes} min</td><td>{exam.opensAt ? new Date(exam.opensAt).toLocaleString() : "Open"}</td><td><button className="button button-primary button-small" disabled={start.isPending} onClick={() => start.mutate(exam.id)}>{start.isPending ? "Starting…" : "Start / resume"}</button></td></tr>)}
-      {!exams.data?.length && <EmptyRow columns={4} text={exams.isLoading ? "Loading exams…" : "No exams are currently available."} />}
+    <section className="card table-card"><div className="table-title"><h2>Available exams</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Duration</th><th>Availability</th><th>Attempts</th><th>Action</th></tr></thead><tbody>
+      {exams.data?.map((exam) => {
+        const completedWithoutRetake = exam.attemptsTaken > 0 && exam.latestAttemptStatus !== "IN_PROGRESS" && exam.retakesRemaining === 0;
+        return <tr key={exam.id}><td className="strong-cell">{exam.title}<small className="table-subtitle">{exam.description}</small></td><td>{exam.durationMinutes} min</td><td>{exam.opensAt ? new Date(exam.opensAt).toLocaleString() : "Open"}</td><td>{exam.latestAttemptNumber ? `Attempt #${exam.latestAttemptNumber}` : "Not started"}{exam.retakesRemaining > 0 && <small className="table-subtitle">{exam.retakesRemaining} rewrite(s) allowed</small>}</td><td><button className="button button-primary button-small" disabled={start.isPending || completedWithoutRetake} onClick={() => start.mutate(exam.id)}>{start.isPending ? "Starting…" : exam.latestAttemptStatus === "IN_PROGRESS" ? "Resume" : completedWithoutRetake ? "Completed" : exam.attemptsTaken > 0 ? "Rewrite exam" : "Start exam"}</button></td></tr>;
+      })}
+      {!exams.data?.length && <EmptyRow columns={5} text={exams.isLoading ? "Loading exams…" : "No exams are currently available."} />}
     </tbody></table></div></section>
-    <section className="card table-card"><div className="table-title"><h2>My results</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Score</th><th>Submitted</th><th>Review</th></tr></thead><tbody>
-      {results.data?.map((result) => <tr key={result.id}><td className="strong-cell">{result.exam.title}</td><td>{result.score ?? "—"}</td><td>{result.submittedAt ? new Date(result.submittedAt).toLocaleString() : "—"}</td><td><button className="button button-outline button-small" onClick={() => setReviewId(result.id)}>Review answers</button></td></tr>)}
-      {!results.data?.length && <EmptyRow columns={4} text={results.isLoading ? "Loading results…" : "Your graded results will appear here."} />}
+    <section className="card table-card"><div className="table-title"><h2>My results</h2></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Attempt</th><th>Score</th><th>Submitted</th><th>Review</th></tr></thead><tbody>
+      {results.data?.map((result) => <tr key={result.id}><td className="strong-cell">{result.exam.title}</td><td>#{result.attemptNumber}</td><td>{result.score ?? "—"}</td><td>{result.submittedAt ? new Date(result.submittedAt).toLocaleString() : "—"}</td><td><button className="button button-outline button-small" onClick={() => setReviewId(result.id)}>Review answers</button></td></tr>)}
+      {!results.data?.length && <EmptyRow columns={5} text={results.isLoading ? "Loading results…" : "Your graded results will appear here."} />}
     </tbody></table></div></section>
   </div>;
 }

@@ -143,6 +143,9 @@ For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, 
 
 - The SQLite database is at `apps/server/prisma/chemarena.db`. Keep the laptop plugged in during exams and include that directory in normal system backups.
 - Sessions and exam answers are stored locally; passwords are hashed. Do not share the `.env` file or database backups.
+- Admins can permanently delete a student from **Students**. This removes the account and all of that student's attempts, answers, and results; the deletion action itself remains in the audit log.
+- From an exam's **Monitor** view, an admin can grant a student one additional attempt using **Allow rewrite**. Each rewrite creates a numbered attempt and preserves earlier graded results. Students can only start a rewrite when the exam is still available and they have an unused grant.
+- Admins can permanently delete exams from **Exams**. This also deletes every linked attempt, answer, and result. The app shows a confirmation before deletion; this cannot be undone except by restoring a backup.
 - The LAN deployment uses plain HTTP as requested. Other people with access to an untrusted Wi-Fi network may be able to observe traffic; use a trusted, isolated school network and do not reuse personal passwords.
 - The exam package sent to a student does not contain correct-option IDs or explanations. Students can still inspect the question text and options delivered to their own browser; a client-side exam cannot prevent that.
 - Answers can be changed while the exam is open without a server connection, but local browser storage is not a substitute for a separate laptop/database backup. Students should not clear browser data, use private browsing, switch devices mid-exam, or close the exam tab during a dropout.
@@ -215,6 +218,14 @@ npm run db:seed
 6. Use the question-bank prompt/paste path without an OpenAI key. Confirm imported questions remain Draft and review warnings are visible.
 7. Optionally configure a server-side OpenAI key, generate a lesson and a small question batch, and verify the content is staged/stored locally, marked AI/Draft, and not automatically published or approved. Do not put the API key in browser code or share it.
 8. After these manual checks, Phase 3 is ready for review before beginning Phase 4 analytics.
+
+## Admin account and exam controls checklist
+
+1. As admin, permanently delete a disposable student. Confirm the account disappears, the student's exam attempts/results are removed, and deletion is recorded in the audit log.
+2. Assign an exam to a disposable student, complete and submit it, then use its **Monitor** view to choose **Allow rewrite** for that student.
+3. Sign in as the student, start the rewrite, and confirm it is labelled as the next attempt. Submit it and verify the previous score and the new score both remain in **My results**.
+4. Permanently delete a disposable exam with attempts. Confirm the warning names the linked history, then verify the exam and its results are gone.
+5. Check that a student cannot grant retakes, delete accounts, or delete exams through the API.
 
 ## Later phases
 
