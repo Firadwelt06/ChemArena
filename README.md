@@ -2,6 +2,17 @@
 
 ChemArena is a LAN-first organic chemistry practice and CBT platform. A teacher's Windows laptop runs the web server; students use a browser on the same school Wi-Fi network or phone hotspot. After the initial installation and build, normal lessons and exams do not need internet access.
 
+## Editing map and handoff
+
+- Admin screens and client interactions: `apps/web/src/App.tsx`.
+- API routes, permissions, attempt lifecycle and grading: `apps/server/src/index.ts`.
+- Database models and migrations: `apps/server/prisma/schema.prisma`.
+- Shared validation and scoring rules: `packages/shared/src/index.ts`.
+- Relevant tests: `packages/shared/test/scoring.test.ts`, `apps/web/test/`, and `e2e/`.
+- Run `npm test` and `npm run build` after changing behavior.
+
+For the admin student-results adjustment, the phases are: (1) show students by name in an admin list, (2) show and selectively remove a student's attempts for one exam, (3) make a newer saved attempt replace that student's previous score for the same exam, and (4) calculate the average from each student's saved exam results and verify the behavior with tests. Preserve any pre-existing local edits while working; this change is on `feature/admin-attempt-management` in the primary checkout.
+
 ## Start on Windows
 
 1. Install Node.js 22 LTS or newer.
@@ -25,15 +36,17 @@ Do not expose this plain-HTTP server to the public internet.
 
 ## LAN access and connectivity
 
+ChemArena does not need internet or mobile data during normal use. The server laptop and each student device must be connected to the same local Wi-Fi network or hotspot, and the server must remain running. Open the numeric join URL shown on the admin dashboard; a device using cellular data or a different Wi-Fi network cannot reach that local address.
+
 ### Windows Firewall
 
-Allow inbound TCP traffic to the configured port on the **Private** network profile. Open PowerShell as Administrator and run:
+Allow inbound TCP traffic on the configured port from the local subnet. This also works when Windows classifies an offline Wi-Fi network as **Public**, without exposing the server to other internet hosts. Open PowerShell as Administrator and run:
 
 ```powershell
-New-NetFirewallRule -DisplayName "ChemArena LAN" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 4174 -Profile Private
+New-NetFirewallRule -DisplayName "ChemArena LAN" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 4174 -Profile Any -RemoteAddress LocalSubnet
 ```
 
-If the port is changed in `.env`, use that port in the firewall rule and join URL. Do not create a public-profile or internet-facing rule for a school server.
+If the port is changed in `.env`, use that port in the firewall rule and join URL. The `LocalSubnet` scope is important; do not create an unrestricted internet-facing rule for a school server.
 
 ### Keep the laptop address stable
 
@@ -49,7 +62,7 @@ Do not rely on a manually configured static address unless the network administr
 
 Hotspot behavior varies by phone and carrier. Some hotspots isolate connected clients, change the laptop's IP when recreated, or restrict local traffic. Connect both the teacher laptop and one student device to the hotspot, read the current join URL from the dashboard, and test the student device before class. Keep the hotspot awake and powered during an exam.
 
-The login screen includes a **Test connection** check. Open the join URL from a second phone/tablet/laptop and run that check before exam day. The server cannot reliably detect router client isolation from the teacher laptop alone; if the test fails while both devices show the same Wi-Fi name, check the router/hotspot's AP/client-isolation setting, Windows Private firewall rule and current laptop IP.
+The login screen includes a **Test connection** check. Open the join URL from a second phone/tablet/laptop and run that check before exam day. The server cannot reliably detect router client isolation from the teacher laptop alone; if the test fails while both devices show the same Wi-Fi name, check the router/hotspot's AP/client-isolation setting, the Windows firewall rule above and the current laptop IP. Some guest Wi-Fi networks and phone hotspots block communication between connected devices; internet access does not fix that isolation.
 
 ## Seed content and accounts
 
@@ -145,7 +158,8 @@ For AI JSON, use `{"questions":[...]}`. Each question has `chapter`, `outcome`, 
 - The SQLite database is at `apps/server/prisma/chemarena.db`. Keep the laptop plugged in during exams and include that directory in normal system backups.
 - Sessions and exam answers are stored locally; passwords are hashed. Do not share the `.env` file or database backups.
 - Admins can permanently delete a student from **Students**. This removes the account and all of that student's attempts, answers, and results; the deletion action itself remains in the audit log.
-- From an exam's **Monitor** view, an admin can grant a student one additional attempt using **Allow rewrite**. Each rewrite creates a numbered attempt and preserves earlier graded results. Students can only start a rewrite when the exam is still available and they have an unused grant.
+- From an exam's **Monitor** view, an admin can see the assigned student list and each student's attempt history, then delete a specific attempt to remove its answers and score and allow a restart. The admin can also grant an additional attempt using **Allow rewrite**.
+- **My results** and analytics show only each student's latest graded score for each exam; the average is calculated across those saved exam scores. Earlier attempts remain available in the admin attempt history unless deleted.
 - Admins can permanently delete exams from **Exams**. This also deletes every linked attempt, answer, and result. The app shows a confirmation before deletion; this cannot be undone except by restoring a backup.
 - Graded answers retain a server-side question snapshot so later corrections do not rewrite previous answer reviews or analytics. Existing graded answers are snapshotted on startup; edits are blocked while any included attempt is still active or awaiting grading.
 - The LAN deployment uses plain HTTP as requested. Other people with access to an untrusted Wi-Fi network may be able to observe traffic; use a trusted, isolated school network and do not reuse personal passwords.
@@ -224,10 +238,12 @@ npm run db:seed
 ## Admin account and exam controls checklist
 
 1. As admin, permanently delete a disposable student. Confirm the account disappears, the student's exam attempts/results are removed, and deletion is recorded in the audit log.
-2. Assign an exam to a disposable student, complete and submit it, then use its **Monitor** view to choose **Allow rewrite** for that student.
-3. Sign in as the student, start the rewrite, and confirm it is labelled as the next attempt. Submit it and verify the previous score and the new score both remain in **My results**.
-4. Permanently delete a disposable exam with attempts. Confirm the warning names the linked history, then verify the exam and its results are gone.
-5. Check that a student cannot grant retakes, delete accounts, or delete exams through the API.
+2. Create an exam assigned to a disposable student with future availability dates. Use **Publish** to make it available immediately; confirm the student can see and start it before the opening date. Use **Close** and confirm new starts are blocked, then publish it again.
+3. Assign an exam to a disposable student, complete and submit it, then use its **Monitor** view to choose **Allow rewrite** for that student.
+4. Sign in as the student, start the rewrite, and confirm it is labelled as the next attempt. Submit it and verify **My results** shows only the new score for that exam while the admin attempt history retains both attempts.
+5. In **Monitor**, expand that student's attempt history, delete one attempt, and confirm its score and answers are removed and the student can restart the exam.
+6. Permanently delete a disposable exam with attempts. Confirm the warning names the linked history, then verify the exam and its results are gone.
+7. Check that a student cannot grant retakes, delete attempts, delete accounts, or delete exams through the API.
 
 ## Phase 4 progress checklist
 

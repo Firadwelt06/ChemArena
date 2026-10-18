@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  averageSavedExamScorePercent,
   AnswerSubmissionSchema,
   ExamInputSchema,
   FinalExamSubmissionSchema,
   hasRole,
   isSameIdempotentPayload,
   isWithinSubmissionWindow,
+  latestSavedAttemptsByStudentExam,
   scoreAnswer,
   StudentImportSchema,
   TopicInputSchema
@@ -21,6 +23,45 @@ describe("scoreAnswer", () => {
   it("applies negative marks only to incorrect non-empty answers", () => {
     expect(scoreAnswer(["a"], ["b"], 2, 0.5)).toBe(-0.5);
     expect(scoreAnswer(["a"], [], 2, 0.5)).toBe(0);
+  });
+});
+
+describe("latestSavedAttemptsByStudentExam", () => {
+  it("keeps only the newest graded score for each student and exam", () => {
+    const attempts = [
+      { id: "ada-old", userId: "ada", examId: "chem-1", submittedAt: new Date("2026-01-01"), score: 4 },
+      { id: "linus-1", userId: "linus", examId: "chem-1", submittedAt: new Date("2026-01-02"), score: 7 },
+      { id: "ada-other", userId: "ada", examId: "chem-2", submittedAt: new Date("2026-01-03"), score: 6 },
+      { id: "ada-new", userId: "ada", examId: "chem-1", submittedAt: new Date("2026-01-04"), score: 9 }
+    ];
+
+    expect(latestSavedAttemptsByStudentExam(attempts).map(({ id }) => id)).toEqual([
+      "ada-new",
+      "linus-1",
+      "ada-other"
+    ]);
+  });
+
+  it("prefers a higher attempt number when timestamps are identical", () => {
+    const attempts = [
+      { id: "ada-1", userId: "ada", examId: "chem-1", attemptNumber: 1, submittedAt: "2026-01-03T00:00:00.000Z", score: 40, maximumScore: 100 },
+      { id: "ada-2", userId: "ada", examId: "chem-1", attemptNumber: 2, submittedAt: "2026-01-03T00:00:00.000Z", score: 70, maximumScore: 100 }
+    ];
+
+    expect(latestSavedAttemptsByStudentExam(attempts).map(({ id }) => id)).toEqual(["ada-2"]);
+  });
+});
+
+describe("averageSavedExamScorePercent", () => {
+  it("averages only the latest saved score for each exam", () => {
+    const attempts = [
+      { userId: "ada", examId: "chem-1", submittedAt: "2026-01-01T00:00:00.000Z", score: 40, maximumScore: 100 },
+      { userId: "ada", examId: "chem-1", submittedAt: "2026-01-04T00:00:00.000Z", score: 80, maximumScore: 100 },
+      { userId: "ada", examId: "chem-2", submittedAt: "2026-01-03T00:00:00.000Z", score: 50, maximumScore: 100 }
+    ];
+
+    expect(averageSavedExamScorePercent(attempts)).toBe(65);
+    expect(averageSavedExamScorePercent([])).toBe(0);
   });
 });
 

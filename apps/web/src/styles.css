@@ -134,6 +134,7 @@ table { width: 100%; border-collapse: collapse; white-space: nowrap; }
 th { padding: 10px 12px; border-bottom: 1px solid #e9edf2; color: #8793a2; text-align: left; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
 td { padding: 11px 12px; border-bottom: 1px solid #f0f2f5; color: #69778a; font-size: 11px; }
 tr:last-child td { border-bottom: 0; }.strong-cell { color: #293a50; font-weight: 650; }.table-subtitle { display: block; margin-top: 4px; color: #8894a2; font-size: 10px; font-weight: 400; }
+.attempt-history { margin-top: 7px; font-size: 10px; font-weight: 400; }.attempt-history summary { color: #526176; cursor: pointer; }.attempt-history ul { display: grid; gap: 7px; margin: 7px 0 0; padding: 0; list-style: none; }.attempt-history li { display: grid; justify-items: start; gap: 4px; padding: 7px; border: 1px solid #e8edf2; border-radius: 6px; font-weight: 400; }.attempt-history li > small { color: #8894a2; }
 .status-pill { display: inline-flex; align-items: center; padding: 4px 7px; border-radius: 15px; font-size: 9px; font-weight: 700; text-transform: capitalize; }
 .status-good { color: #16835e; background: #e9f7f1; }.status-muted { color: #798596; background: #eff1f4; }
 .action-cell { display: flex; gap: 6px; }.empty-row { padding: 28px 12px; color: #98a2af; text-align: center; }
