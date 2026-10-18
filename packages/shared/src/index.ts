@@ -7,6 +7,60 @@ export function hasRole(actualRole: Role | undefined, requiredRole: Role): boole
   return actualRole === requiredRole;
 }
 
+export function latestSavedAttemptsByStudentExam<T extends {
+  userId: string;
+  examId: string;
+  submittedAt: Date | string | null;
+}>(attempts: readonly T[]): T[] {
+  const timestamp = (value: Date | string | null) => {
+    if (value instanceof Date) return Number.isFinite(value.getTime()) ? value.getTime() : 0;
+    if (value === null || value === "") return 0;
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  const latest = new Map<string, T>();
+  for (const attempt of attempts) {
+    const key = JSON.stringify([attempt.userId, attempt.examId]);
+    const previous = latest.get(key);
+    if (!previous) {
+      latest.set(key, attempt);
+      continue;
+    }
+    const currentTimestamp = timestamp(attempt.submittedAt);
+    const previousTimestamp = timestamp(previous.submittedAt);
+    if (currentTimestamp > previousTimestamp) {
+      latest.set(key, attempt);
+      continue;
+    }
+    if (currentTimestamp === previousTimestamp && "attemptNumber" in attempt && "attemptNumber" in previous) {
+      const currentAttemptNumber = typeof attempt.attemptNumber === "number" ? attempt.attemptNumber : 0;
+      const previousAttemptNumber = typeof previous.attemptNumber === "number" ? previous.attemptNumber : 0;
+      if (currentAttemptNumber > previousAttemptNumber) {
+        latest.set(key, attempt);
+      }
+    }
+  }
+  return [...latest.values()];
+}
+
+export function averageSavedExamScorePercent<T extends {
+  userId: string;
+  examId: string;
+  submittedAt: Date | string | null;
+  score: number;
+  maximumScore: number;
+}>(attempts: readonly T[]): number {
+  const latestAttempts = latestSavedAttemptsByStudentExam(attempts);
+  if (!latestAttempts.length) return 0;
+  const totalPercent = latestAttempts.reduce((total, attempt) => {
+    const percent = attempt.maximumScore > 0
+      ? Math.max(0, Math.min(100, (attempt.score / attempt.maximumScore) * 100))
+      : 0;
+    return total + percent;
+  }, 0);
+  return totalPercent / latestAttempts.length;
+}
+
 export const LoginSchema = z.object({
   username: z.string().trim().min(1).max(64),
   password: z.string().min(1).max(256)

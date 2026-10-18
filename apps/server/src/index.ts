@@ -11,7 +11,7 @@ import argon2 from "argon2";
 import { PrismaClient, Role, RecordStatus } from "@prisma/client";
 import {
   AnswerSubmissionSchema, BrandingSchema, ExamInputSchema, FinalExamSubmissionSchema, GeneratedQuestionBatchSchema,
-  hasRole, inspectSmiles, isSameIdempotentPayload, LessonContentSchema, LessonGenerationRequestSchema, LessonSaveSchema,
+  hasRole, inspectSmiles, isSameIdempotentPayload, latestSavedAttemptsByStudentExam, LessonContentSchema, LessonGenerationRequestSchema, LessonSaveSchema,
   LoginSchema, QuestionGenerationRequestSchema, QuestionSchema, scoreAnswer, StudentImportSchema, TopicInputSchema
 } from "@chemarena/shared";
 
@@ -608,7 +608,7 @@ app.get("/api/admin/dashboard", { preHandler: requireAdmin }, async () => {
 });
 
 app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
-  const [attempts, auditLog] = await Promise.all([
+  const [gradedAttempts, auditLog] = await Promise.all([
     prisma.examAttempt.findMany({
       where: { status: "GRADED", exam: { isPractice: false } },
       include: {
@@ -624,6 +624,7 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
       take: 100
     })
   ]);
+  const attempts = latestSavedAttemptsByStudentExam(gradedAttempts);
   const questionIds = [...new Set(attempts.flatMap((attempt) => JSON.parse(attempt.questionOrder) as string[]))];
   const questions = await prisma.question.findMany({
     where: { id: { in: questionIds } },
@@ -645,6 +646,8 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
     studentName: string;
     username: string;
     classes: string[];
+    classIds: string[];
+    examId: string;
     examTitle: string;
     attemptNumber: number;
     score: number;
@@ -656,6 +659,8 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
     studentId: string;
     studentName: string;
     username: string;
+    classId: string;
+    className: string;
     topicId: string;
     topicTitle: string;
     correct: number;
@@ -671,6 +676,8 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
   }>();
   const itemAnalysis = new Map<string, {
     questionId: string;
+    classId: string;
+    className: string;
     stem: string;
     topicTitle: string;
     attempts: number;
@@ -701,6 +708,8 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
       studentName: attempt.user.displayName,
       username: attempt.user.username,
       classes: attempt.user.enrollments.map(({ class: record }) => record.name).sort(),
+      classIds: attempt.user.enrollments.map(({ class: record }) => record.id).sort(),
+      examId: attempt.examId,
       examTitle: attempt.exam.title,
       attemptNumber: attempt.attemptNumber,
       score: attempt.score ?? 0,
@@ -725,34 +734,41 @@ app.get("/api/admin/analytics", { preHandler: requireAdmin }, async () => {
       const topicId = snapshot?.topicId ?? question.topic.id;
       const topicTitle = snapshot?.topicTitle ?? question.topic.title;
       const isCorrect = selected.length === correctIds.length && correctIds.every((id) => selected.includes(id));
-      const studentTopicKey = `${attempt.user.id}:${topicId}`;
-      const studentTopic = studentTopics.get(studentTopicKey) ?? {
-        studentId: attempt.user.id,
-        studentName: attempt.user.displayName,
-        username: attempt.user.username,
-        topicId,
-        topicTitle,
-        correct: 0,
-        total: 0
-      };
-      studentTopic.total += 1;
-      if (isCorrect) studentTopic.correct += 1;
-      studentTopics.set(studentTopicKey, studentTopic);
-      const item = itemAnalysis.get(questionId) ?? {
-        questionId,
-        stem: snapshot?.stem ?? question.stem,
-        topicTitle,
-        attempts: 0,
-        correct: 0,
-        options: new Map<string, number>(),
-        optionLabels: Object.fromEntries((snapshot?.options ?? JSON.parse(question.options) as Array<{ id: string; text: string }>).map((option) => [option.id, option.text]))
-      };
-      item.attempts += 1;
-      if (isCorrect) item.correct += 1;
-      selected.forEach((optionId) => item.options.set(optionId, (item.options.get(optionId) ?? 0) + 1));
-      itemAnalysis.set(questionId, item);
-      for (const enrollment of attempt.user.enrollments) {
-        const record = enrollment.class;
+      const classes = attempt.user.enrollments.length
+        ? attempt.user.enrollments.map(({ class: record }) => record)
+        : [{ id: "", name: "No class" }];
+      for (const record of classes) {
+        const studentTopicKey = `${record.id}:${attempt.user.id}:${topicId}`;
+        const studentTopic = studentTopics.get(studentTopicKey) ?? {
+          studentId: attempt.user.id,
+          studentName: attempt.user.displayName,
+          username: attempt.user.username,
+          classId: record.id,
+          className: record.name,
+          topicId,
+          topicTitle,
+          correct: 0,
+          total: 0
+        };
+        studentTopic.total += 1;
+        if (isCorrect) studentTopic.correct += 1;
+        studentTopics.set(studentTopicKey, studentTopic);
+        const itemKey = `${record.id}:${questionId}`;
+        const item = itemAnalysis.get(itemKey) ?? {
+          questionId,
+          classId: record.id,
+          className: record.name,
+          stem: snapshot?.stem ?? question.stem,
+          topicTitle,
+          attempts: 0,
+          correct: 0,
+          options: new Map<string, number>(),
+          optionLabels: Object.fromEntries((snapshot?.options ?? JSON.parse(question.options) as Array<{ id: string; text: string }>).map((option) => [option.id, option.text]))
+        };
+        item.attempts += 1;
+        if (isCorrect) item.correct += 1;
+        selected.forEach((optionId) => item.options.set(optionId, (item.options.get(optionId) ?? 0) + 1));
+        itemAnalysis.set(itemKey, item);
         const key = `${record.id}:${topicId}`;
         const cell = heatmap.get(key) ?? {
           classId: record.id,
@@ -1499,6 +1515,26 @@ app.post("/api/admin/exams", { preHandler: [requireCsrf, requireAdmin] }, async 
   return reply.code(201).send(exam);
 });
 
+app.patch("/api/admin/exams/:examId/duration", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { examId } = request.params as { examId: string };
+  const body = request.body;
+  if (typeof body !== "object" || body === null || !("durationMinutes" in body)) {
+    return reply.code(400).send({ error: "Enter an exam duration in whole minutes from 1 to 480." });
+  }
+  const durationMinutes = (body as { durationMinutes: unknown }).durationMinutes;
+  if (typeof durationMinutes !== "number" || !Number.isInteger(durationMinutes) || durationMinutes < 1 || durationMinutes > 480) {
+    return reply.code(400).send({ error: "Exam duration must be a whole number of minutes from 1 to 480." });
+  }
+  const exam = await prisma.exam.findFirst({ where: { id: examId, isPractice: false } });
+  if (!exam) return reply.code(404).send({ error: "Exam not found." });
+  const updated = await prisma.exam.update({ where: { id: examId }, data: { durationMinutes } });
+  await audit(request.auth!.userId, "exam.duration_updated", "Exam", examId, {
+    previousDurationMinutes: exam.durationMinutes,
+    durationMinutes
+  });
+  return { id: updated.id, durationMinutes: updated.durationMinutes };
+});
+
 app.get("/api/admin/exams", { preHandler: requireAdmin }, async () =>
   prisma.exam.findMany({
     where: { isPractice: false },
@@ -1521,7 +1557,7 @@ app.post("/api/admin/exams/:examId/students/:userId/retakes", { preHandler: [req
   if (exam.status !== "SCHEDULED" && exam.status !== "ACTIVE") {
     return reply.code(409).send({ error: "Retakes can only be granted while the exam is scheduled or active." });
   }
-  if (exam.closesAt && exam.closesAt < new Date()) {
+  if (exam.status === "SCHEDULED" && exam.closesAt && exam.closesAt < new Date()) {
     return reply.code(409).send({ error: "This exam's availability window has ended." });
   }
   const enrollments = await prisma.enrollment.findMany({ where: { userId }, select: { classId: true } });
@@ -1563,9 +1599,11 @@ app.delete("/api/admin/exams/:id", { preHandler: [requireCsrf, requireAdmin] }, 
 
 app.patch("/api/admin/exams/:id/status", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
   const { id } = request.params as { id: string };
-  const body = request.body as { status?: unknown };
-  if (body.status !== "SCHEDULED" && body.status !== "CLOSED" && body.status !== "VOID") {
-    return reply.code(400).send({ error: "Choose SCHEDULED, CLOSED or VOID." });
+  const body = request.body;
+  if (typeof body !== "object" || body === null || Array.isArray(body)
+    || !("status" in body)
+    || (body.status !== "ACTIVE" && body.status !== "SCHEDULED" && body.status !== "CLOSED" && body.status !== "VOID")) {
+    return reply.code(400).send({ error: "Choose ACTIVE, SCHEDULED, CLOSED or VOID." });
   }
   const exam = await prisma.exam.update({ where: { id }, data: { status: body.status } });
   await audit(request.auth!.userId, "exam.status_changed", "Exam", id, { status: body.status });
@@ -1609,8 +1647,28 @@ app.get("/api/admin/exams/:id/monitor", { preHandler: requireAdmin }, async (req
     prisma.examRetakeGrant.findMany({ where: { examId: id, userId: { in: userIds } }, select: { userId: true, remainingAttempts: true } })
   ]);
   const attemptByUser = new Map(attempts.map((attempt) => [attempt.userId, attempt]));
+  const attemptsByUser = new Map<string, Array<{
+    id: string;
+    attemptNumber: number;
+    status: string;
+    score: number | null;
+    startedAt: Date;
+    submittedAt: Date | null;
+  }>>();
   const attemptCountByUser = new Map<string, number>();
-  attempts.forEach((attempt) => attemptCountByUser.set(attempt.userId, (attemptCountByUser.get(attempt.userId) ?? 0) + 1));
+  attempts.forEach((attempt) => {
+    attemptCountByUser.set(attempt.userId, (attemptCountByUser.get(attempt.userId) ?? 0) + 1);
+    const history = attemptsByUser.get(attempt.userId) ?? [];
+    history.push({
+      id: attempt.id,
+      attemptNumber: attempt.attemptNumber,
+      status: attempt.status,
+      score: attempt.score,
+      startedAt: attempt.startedAt,
+      submittedAt: attempt.submittedAt
+    });
+    attemptsByUser.set(attempt.userId, history);
+  });
   const retakesByUser = new Map(retakeGrants.map((grant) => [grant.userId, grant.remainingAttempts]));
   const recentSessions = new Set(sessions.filter((session) => now - session.lastSeenAt.getTime() < 45_000).map(({ userId }) => userId));
   return [...assignedUsers.values()].map((user) => {
@@ -1622,6 +1680,7 @@ app.get("/api/admin/exams/:id/monitor", { preHandler: requireAdmin }, async (req
       status: attempt?.status ?? "NOT_STARTED",
       attemptNumber: attempt?.attemptNumber ?? null,
       attemptsTaken: attemptCountByUser.get(user.id) ?? 0,
+      attempts: attemptsByUser.get(user.id) ?? [],
       retakesRemaining: retakesByUser.get(user.id) ?? 0,
       joined: recentSessions.has(user.id) || (active && now - attempt.lastSeenAt.getTime() < 45_000),
       startedAt: attempt?.startedAt ?? null,
@@ -1632,6 +1691,36 @@ app.get("/api/admin/exams/:id/monitor", { preHandler: requireAdmin }, async (req
       online: recentSessions.has(user.id) || (active && now - attempt.lastSeenAt.getTime() < 45_000)
     };
   });
+});
+
+app.delete("/api/admin/exams/:examId/attempts/:attemptId", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
+  const { examId, attemptId } = request.params as { examId: string; attemptId: string };
+  const attempt = await prisma.examAttempt.findFirst({
+    where: { id: attemptId, examId },
+    select: { id: true, examId: true, userId: true, attemptNumber: true, status: true, score: true }
+  });
+  if (!attempt) return reply.code(404).send({ error: "Exam attempt not found." });
+  const remainingAttempts = await prisma.$transaction(async (transaction) => {
+    await transaction.examAttempt.delete({ where: { id: attempt.id } });
+    const remaining = await transaction.examAttempt.count({ where: { examId, userId: attempt.userId } });
+    if (remaining > 0) {
+      await transaction.examRetakeGrant.upsert({
+        where: { examId_userId: { examId, userId: attempt.userId } },
+        create: { examId, userId: attempt.userId, remainingAttempts: 1 },
+        update: { remainingAttempts: { increment: 1 } }
+      });
+    }
+    return remaining;
+  });
+  await audit(request.auth!.userId, "exam_attempt.deleted", "ExamAttempt", attempt.id, {
+    examId,
+    userId: attempt.userId,
+    attemptNumber: attempt.attemptNumber,
+    status: attempt.status,
+    score: attempt.score,
+    remainingAttempts
+  });
+  return { ok: true, remainingAttempts };
 });
 
 app.post("/api/admin/attempts/:id/extend", { preHandler: [requireCsrf, requireAdmin] }, async (request: AuthenticatedRequest, reply) => {
@@ -1655,8 +1744,23 @@ app.post("/api/admin/attempts/:id/reset", { preHandler: [requireCsrf, requireAdm
   const attempt = await prisma.examAttempt.findUnique({ where: { id } });
   if (!attempt) return reply.code(404).send({ error: "Attempt not found." });
   if (attempt.status !== "IN_PROGRESS") return reply.code(409).send({ error: "Only an in-progress attempt can be reset." });
-  await prisma.examAttempt.delete({ where: { id } });
-  await audit(request.auth!.userId, "exam_attempt.reset", "ExamAttempt", id, { userId: attempt.userId, examId: attempt.examId });
+  const remainingAttempts = await prisma.$transaction(async (transaction) => {
+    await transaction.examAttempt.delete({ where: { id } });
+    const remaining = await transaction.examAttempt.count({ where: { examId: attempt.examId, userId: attempt.userId } });
+    if (remaining > 0) {
+      await transaction.examRetakeGrant.upsert({
+        where: { examId_userId: { examId: attempt.examId, userId: attempt.userId } },
+        create: { examId: attempt.examId, userId: attempt.userId, remainingAttempts: 1 },
+        update: { remainingAttempts: { increment: 1 } }
+      });
+    }
+    return remaining;
+  });
+  await audit(request.auth!.userId, "exam_attempt.reset", "ExamAttempt", id, {
+    userId: attempt.userId,
+    examId: attempt.examId,
+    remainingAttempts
+  });
   return { ok: true };
 });
 
@@ -1766,9 +1870,18 @@ app.get("/api/student/exams", { preHandler: requireStudent }, async (request: Au
   const now = new Date();
   const exams = await prisma.exam.findMany({
     where: {
-      status: { in: ["SCHEDULED", "ACTIVE"] },
-      AND: [{ OR: [{ opensAt: null }, { opensAt: { lte: now } }] }, { OR: [{ closesAt: null }, { closesAt: { gte: now } }] }],
-      OR: [{ classes: { some: { classId: { in: classIds } } } }, { students: { some: { userId: request.auth!.userId } } }]
+      AND: [
+        {
+          OR: [
+            { status: "ACTIVE" },
+            {
+              status: "SCHEDULED",
+              AND: [{ OR: [{ opensAt: null }, { opensAt: { lte: now } }] }, { OR: [{ closesAt: null }, { closesAt: { gte: now } }] }]
+            }
+          ]
+        },
+        { OR: [{ classes: { some: { classId: { in: classIds } } } }, { students: { some: { userId: request.auth!.userId } } }] }
+      ]
     },
     include: {
       attempts: {
@@ -1808,7 +1921,7 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
     || exam.classes.some(({ classId }) => enrollments.some((enrollment) => enrollment.classId === classId));
   if (!assigned) return reply.code(403).send({ error: "This exam is not assigned to you." });
   const now = new Date();
-  if ((exam.opensAt && now < exam.opensAt) || (exam.closesAt && now > exam.closesAt)) {
+  if (exam.status === "SCHEDULED" && ((exam.opensAt && now < exam.opensAt) || (exam.closesAt && now > exam.closesAt))) {
     return reply.code(403).send({ error: "This exam is outside its availability window." });
   }
   let attempt = await prisma.examAttempt.findFirst({
@@ -1858,8 +1971,12 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
           orderBy: { attemptNumber: "desc" }
         });
         if (alreadyStarted) return { attempt: alreadyStarted, created: false };
-        const previousAttempts = await transaction.examAttempt.count({ where: { examId: id, userId: request.auth!.userId } });
-        if (previousAttempts > 0) {
+        const previousAttempt = await transaction.examAttempt.findFirst({
+          where: { examId: id, userId: request.auth!.userId },
+          orderBy: { attemptNumber: "desc" },
+          select: { attemptNumber: true }
+        });
+        if (previousAttempt) {
           const consumed = await transaction.examRetakeGrant.updateMany({
             where: { examId: id, userId: request.auth!.userId, remainingAttempts: { gt: 0 } },
             data: { remainingAttempts: { decrement: 1 } }
@@ -1870,7 +1987,7 @@ app.post("/api/student/exams/:id/start", { preHandler: [requireCsrf, requireStud
           data: {
             examId: id,
             userId: request.auth!.userId,
-            attemptNumber: previousAttempts + 1,
+            attemptNumber: (previousAttempt?.attemptNumber ?? 0) + 1,
             deadline: new Date(now.getTime() + exam.durationMinutes * 60_000),
             questionOrder: JSON.stringify(questionOrder),
             optionOrders: JSON.stringify(optionOrders)
@@ -2240,20 +2357,32 @@ app.get("/api/student/results/:id/review", { preHandler: requireStudent }, async
   };
 });
 
-app.get("/api/student/results", { preHandler: requireStudent }, async (request: AuthenticatedRequest) =>
-  prisma.examAttempt.findMany({
+app.get("/api/student/results", { preHandler: requireStudent }, async (request: AuthenticatedRequest) => {
+  const attempts = await prisma.examAttempt.findMany({
     where: { userId: request.auth!.userId, status: "GRADED" },
-    select: { id: true, attemptNumber: true, status: true, score: true, submittedAt: true, exam: { select: { title: true } } },
+    include: { exam: { select: { title: true } } },
     orderBy: { submittedAt: "desc" }
-  })
-);
+  });
+  return latestSavedAttemptsByStudentExam(attempts)
+    .sort((left, right) => (right.submittedAt?.getTime() ?? 0) - (left.submittedAt?.getTime() ?? 0))
+    .map(({ id, attemptNumber, status, score, submittedAt, exam }) => ({
+      id,
+      attemptNumber,
+      status,
+      score,
+      submittedAt,
+      exam
+    }));
+});
 
 async function studentPerformance(userId: string) {
-  const attempts = await prisma.examAttempt.findMany({
+  const gradedAttempts = await prisma.examAttempt.findMany({
     where: { userId, status: "GRADED" },
     include: { exam: { select: { title: true, marksPerQuestion: true } }, answers: true },
     orderBy: { submittedAt: "asc" }
   });
+  const attempts = latestSavedAttemptsByStudentExam(gradedAttempts)
+    .sort((left, right) => (left.submittedAt?.getTime() ?? 0) - (right.submittedAt?.getTime() ?? 0));
   const questionIds = [...new Set(attempts.flatMap((attempt) => JSON.parse(attempt.questionOrder) as string[]))];
   const questions = await prisma.question.findMany({
     where: { id: { in: questionIds } },

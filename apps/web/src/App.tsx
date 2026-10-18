@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent,
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Papa from "papaparse";
 import { QRCodeSVG } from "qrcode.react";
+import { averageSavedExamScorePercent } from "@chemarena/shared";
 import {
   Activity, BookOpen, Boxes, ChevronRight, CircleHelp, Database, Download, FileUp, FlaskConical, GraduationCap,
   LayoutDashboard, LogOut, Menu, Plus, Printer, RefreshCw, Settings, ShieldCheck, Users, X
@@ -175,10 +176,10 @@ function LoginPage({ branding, error, busy, onLogin }: {
         <button className="button button-primary button-full" disabled={busy}>{busy ? "Signing in…" : "Sign in"}<ChevronRight size={17} /></button>
       </form>
       <div className="connectivity-box">
-        <div><ShieldCheck size={17} /><span><strong>Pre-exam connectivity</strong><small>Confirm this device can reach the local server.</small></span></div>
+        <div><ShieldCheck size={17} /><span><strong>Pre-exam connectivity</strong><small>Uses your local Wi-Fi; internet or mobile data is not required.</small></span></div>
         <button className="button button-outline button-small" onClick={() => void checkConnection()}>{connectivity === "checking" ? "Checking…" : "Test connection"}</button>
         {connectivity !== "idle" && connectivity !== "checking" && <p className={connectivity === "success" ? "connection-ok" : "connection-failed"} role="status">
-          {connectivity === "success" ? "Connected to the ChemArena server." : "Cannot reach the server. Check Wi-Fi and ask your administrator."}
+          {connectivity === "success" ? "Connected to the ChemArena server." : "Cannot reach the local server. Join the same Wi-Fi or hotspot as the server and check its firewall settings."}
         </p>}
       </div>
       <footer>{branding.footerLine}</footer>
@@ -979,7 +980,7 @@ type QuestionIssueRecord = {
 };
 
 type AdminAnalyticsData = {
-  studentScores: Array<{ id: string; studentId: string; studentName: string; username: string; classes: string[]; classIds: string[]; examTitle: string; attemptNumber: number; score: number; maximumScore: number; percent: number; submittedAt: string | null }>;
+  studentScores: Array<{ id: string; studentId: string; studentName: string; username: string; classes: string[]; classIds: string[]; examId: string; examTitle: string; attemptNumber: number; score: number; maximumScore: number; percent: number; submittedAt: string | null }>;
   studentTopics: Array<{ studentId: string; studentName: string; username: string; classId: string; className: string; topicId: string; topicTitle: string; correct: number; total: number; accuracy: number }>;
   leaderboard: Array<{ id: string; username: string; displayName: string; attempts: number; latestSubmittedAt: string | null; averagePercent: number; classes: string[] }>;
   heatmap: Array<{ classId: string; className: string; topicId: string; topicTitle: string; correct: number; total: number; accuracy: number }>;
@@ -991,7 +992,12 @@ function AnalyticsPage() {
   const analytics = useQuery({ queryKey: ["admin-analytics"], queryFn: () => api<AdminAnalyticsData>("/api/admin/analytics") });
   const [selectedClassId, setSelectedClassId] = useState("");
   const [selectedStudentId, setSelectedStudentId] = useState("");
-  const classOptions = [...new Map((analytics.data?.heatmap ?? []).map((cell) => [cell.classId, { id: cell.classId, name: cell.className }])).values()];
+  const classOptions = [...new Map([
+    ...(analytics.data?.heatmap ?? []).map((cell) => [cell.classId, { id: cell.classId, name: cell.className }] as const),
+    ...((analytics.data?.studentScores ?? []).some((result) => result.classIds.length === 0)
+      ? [["", { id: "", name: "No class" }] as const]
+      : [])
+  ]).values()];
   const classScores = (analytics.data?.studentScores ?? []).filter((result) =>
     !selectedClassId || (selectedClassId === "__unassigned__" ? result.classIds.length === 0 : result.classIds.includes(selectedClassId))
   );
@@ -1015,7 +1021,13 @@ function AnalyticsPage() {
         username: latest.username,
         displayName: latest.studentName,
         attempts: scores.length,
-        averagePercent: Number((scores.reduce((total, result) => total + result.percent, 0) / scores.length).toFixed(2)),
+        averagePercent: Number(averageSavedExamScorePercent(scores.map((result) => ({
+          userId: result.studentId,
+          examId: result.examId,
+          submittedAt: result.submittedAt,
+          score: result.score,
+          maximumScore: result.maximumScore
+        }))).toFixed(2)),
         classes: [...new Set(scores.flatMap((result) => result.classes))],
         latestSubmittedAt: latest.submittedAt
       };
@@ -1046,16 +1058,15 @@ function AnalyticsPage() {
     <PageHeader eyebrow="PHASE 4 · ANALYTICS" title="Learning analytics" description="Review student outcomes, topic coverage, question performance and recent administrative activity." action={<div className="action-cell"><button className="button button-outline" onClick={downloadCsv} disabled={!studentScores.length}>Download CSV</button><button className="button button-primary" onClick={() => window.print()} disabled={!studentScores.length}>Print / Save PDF</button></div>} />
     {analytics.error && <ErrorNotice message={(analytics.error as Error).message} />}
     <section className="card table-card">
-      <div className="table-title"><h2>Student report cards</h2><span className="muted">Ranked by average percentage across graded attempts</span></div>
-      <div className="table-title"><h2>Student report cards</h2><span className="muted">Ranked by average percentage across graded attempts</span></div>
+      <div className="table-title"><h2>Student report cards</h2><span className="muted">Ranked by average percentage across each exam's latest saved score</span></div>
       <div className="analytics-report-cards">{leaderboard.map((student, index) => <article className="analytics-report-card" key={student.id}>
         <span className="eyebrow">RANK {index + 1}</span><h3>{student.displayName}</h3><p><code>{student.username}</code> · {student.classes.join(", ") || "No class"}</p>
-        <strong>{student.averagePercent.toFixed(2)}%</strong><small>{student.attempts} graded attempt{student.attempts === 1 ? "" : "s"} · Latest: {student.latestSubmittedAt ? new Date(student.latestSubmittedAt).toLocaleDateString() : "—"}</small>
+        <strong>{student.averagePercent.toFixed(2)}%</strong><small>{student.attempts} saved exam result{student.attempts === 1 ? "" : "s"} · Latest: {student.latestSubmittedAt ? new Date(student.latestSubmittedAt).toLocaleDateString() : "—"}</small>
       </article>)}</div>
       {!leaderboard.length && <p className="muted">{analytics.isLoading ? "Calculating results…" : "Graded attempts will appear here."}</p>}
     </section>
     <section className="card table-card">
-      <div className="table-title"><div><h2>Individual exam scores</h2><span className="muted">One row per graded attempt, newest first</span></div><div className="analytics-filters">
+      <div className="table-title"><div><h2>Individual exam scores</h2><span className="muted">Latest saved score for each student and exam</span></div><div className="analytics-filters">
         <label>Class<select value={selectedClassId} onChange={(event) => { setSelectedClassId(event.target.value); setSelectedStudentId(""); }}><option value="">All classes</option>{classOptions.map((record) => <option key={record.id || "__unassigned__"} value={record.id || "__unassigned__"}>{record.name}</option>)}</select></label>
         <label>Student<select value={selectedStudentId} onChange={(event) => setSelectedStudentId(event.target.value)}><option value="">All students</option>{studentOptions.map((student) => <option key={student.id} value={student.id}>{student.name} ({student.username})</option>)}</select></label>
       </div>
@@ -1133,6 +1144,8 @@ function ExamsPage() {
   const questions = useQuery({ queryKey: ["questions"], queryFn: () => api<QuestionRecord[]>("/api/admin/questions") });
   const classes = useQuery({ queryKey: ["classes"], queryFn: () => api<ClassRecord[]>("/api/admin/classes") });
   const [selectedExam, setSelectedExam] = useState("");
+  const [durationEditId, setDurationEditId] = useState("");
+  const [durationEditValue, setDurationEditValue] = useState(30);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [showBuilder, setShowBuilder] = useState(false);
@@ -1147,20 +1160,42 @@ function ExamsPage() {
     onSuccess: () => { setError(""); setShowBuilder(false); void client.invalidateQueries({ queryKey: ["admin-exams"] }); },
     onError: (e: Error) => setError(e.message)
   });
+  const updateDuration = useMutation({
+    mutationFn: ({ id, durationMinutes }: { id: string; durationMinutes: number }) =>
+      api(`/api/admin/exams/${id}/duration`, { method: "PATCH", body: JSON.stringify({ durationMinutes }) }),
+    onSuccess: () => {
+      setError("");
+      setMessage("Exam time limit updated. Existing in-progress attempts keep their current deadlines.");
+      setDurationEditId("");
+      void client.invalidateQueries({ queryKey: ["admin-exams"] });
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
+  });
   const updateAttempt = useMutation({
     mutationFn: ({ attempt, action }: { attempt: AttemptRecord; action: "extend" | "reset" | "void" }) =>
       api(`/api/admin/attempts/${attempt.id}/${action}`, {
         method: "POST",
         body: JSON.stringify(action === "extend" ? { minutes: 5 } : {})
       }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: ["exam-monitor", selectedExam] }),
+    onSuccess: async () => {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ["exam-monitor", selectedExam] }),
+        client.invalidateQueries({ queryKey: ["admin-exams"] }),
+        client.invalidateQueries({ queryKey: ["admin-analytics"] }),
+        client.invalidateQueries({ queryKey: ["dashboard"] })
+      ]);
+    },
     onError: (e: Error) => setError(e.message)
   });
   const changeExamStatus = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: string }) =>
+    mutationFn: ({ id, status }: { id: string; status: "ACTIVE" | "CLOSED" }) =>
       api(`/api/admin/exams/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: ["admin-exams"] }),
-    onError: (e: Error) => setError(e.message)
+    onSuccess: async (_, { status }) => {
+      setError("");
+      setMessage(status === "ACTIVE" ? "Exam published." : "Exam closed.");
+      await client.invalidateQueries({ queryKey: ["admin-exams"] });
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
   });
   const allowRetake = useMutation({
     mutationFn: (attempt: AttemptRecord) => api<{ remainingAttempts: number }>(`/api/admin/exams/${selectedExam}/students/${attempt.user.id}/retakes`, {
@@ -1171,6 +1206,21 @@ function ExamsPage() {
       setError("");
       setMessage(`Retake allowed. ${remainingAttempts} unused retake${remainingAttempts === 1 ? "" : "s"} remain for this student.`);
       void client.invalidateQueries({ queryKey: ["exam-monitor", selectedExam] });
+    },
+    onError: (e: Error) => { setMessage(""); setError(e.message); }
+  });
+  const deleteAttempt = useMutation({
+    mutationFn: (history: AttemptHistoryRecord) =>
+      api<{ ok: boolean; remainingAttempts: number }>(`/api/admin/exams/${selectedExam}/attempts/${history.id}`, { method: "DELETE" }),
+    onSuccess: async () => {
+      setError("");
+      setMessage("Attempt deleted. Its saved score and answers were removed; the student can restart the exam.");
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ["exam-monitor", selectedExam] }),
+        client.invalidateQueries({ queryKey: ["admin-exams"] }),
+        client.invalidateQueries({ queryKey: ["admin-analytics"] }),
+        client.invalidateQueries({ queryKey: ["dashboard"] })
+      ]);
     },
     onError: (e: Error) => { setMessage(""); setError(e.message); }
   });
@@ -1191,14 +1241,41 @@ function ExamsPage() {
     {showBuilder && <ExamBuilder questions={approvedQuestions} topics={questions.data?.map((q) => q.topic).filter((topic, index, list) => list.findIndex((item) => item.id === topic.id) === index) ?? []} classes={classes.data?.filter((record) => record.status === "ACTIVE") ?? []} onCancel={() => setShowBuilder(false)} onCreate={(body) => create.mutate(body)} busy={create.isPending} />}
     <section className="card table-card"><div className="table-title"><h2>Exam schedule</h2><span className="muted">{exams.data?.length ?? 0} exams</span></div>
       <div className="table-wrap"><table><thead><tr><th>Exam</th><th>Questions</th><th>Duration</th><th>Assigned to</th><th>Status</th><th>Actions</th></tr></thead><tbody>
-        {exams.data?.map((exam) => <tr key={exam.id}><td className="strong-cell">{exam.title}<small className="table-subtitle">{exam._count.attempts} saved attempt{exam._count.attempts === 1 ? "" : "s"}</small></td><td>{exam.questionCount}</td><td>{exam.durationMinutes} min</td><td>{exam.classes.map(({ class: record }) => record.name).join(", ") || "Individual students"}</td><td><StatusPill status={exam.status} /></td><td className="action-cell"><button className="button button-outline button-small" onClick={() => setSelectedExam(selectedExam === exam.id ? "" : exam.id)}>{selectedExam === exam.id ? "Hide" : "Monitor"}</button>{exam.status === "SCHEDULED" && <button className="button button-outline button-small" onClick={() => changeExamStatus.mutate({ id: exam.id, status: "CLOSED" })}>Close</button>}<button className="button button-danger button-small" disabled={deleteExam.isPending} onClick={() => { if (window.confirm(`Permanently delete "${exam.title}"? This will also permanently delete ${exam._count.attempts} student attempt(s), answers, scores, and results. This cannot be undone.`)) deleteExam.mutate(exam); }}>Delete</button></td></tr>)}
+        {exams.data?.map((exam) => <tr key={exam.id}><td className="strong-cell">{exam.title}<small className="table-subtitle">{exam._count.attempts} saved attempt{exam._count.attempts === 1 ? "" : "s"}</small></td><td>{exam.questionCount}</td><td>{durationEditId === exam.id
+          ? <form className="action-cell" onSubmit={(event) => { event.preventDefault(); updateDuration.mutate({ id: exam.id, durationMinutes: durationEditValue }); }}>
+            <input aria-label={`Time limit for ${exam.title} in minutes`} type="number" min={1} max={480} step={1} required value={durationEditValue} onChange={(event) => setDurationEditValue(Number(event.target.value))} />
+            <button className="button button-primary button-small" disabled={updateDuration.isPending}>Save</button>
+            <button type="button" className="button button-outline button-small" onClick={() => setDurationEditId("")}>Cancel</button>
+          </form>
+          : <div className="action-cell"><span>{exam.durationMinutes} min</span><button className="button button-outline button-small" onClick={() => { setDurationEditId(exam.id); setDurationEditValue(exam.durationMinutes); }}>Edit</button></div>}</td><td>{exam.classes.map(({ class: record }) => record.name).join(", ") || "Individual students"}</td><td><StatusPill status={exam.status} /></td><td className="action-cell"><button className="button button-outline button-small" onClick={() => setSelectedExam(selectedExam === exam.id ? "" : exam.id)}>{selectedExam === exam.id ? "Hide" : "Monitor"}</button>{(exam.status === "SCHEDULED" || exam.status === "CLOSED") && <button className="button button-primary button-small" disabled={changeExamStatus.isPending} onClick={() => changeExamStatus.mutate({ id: exam.id, status: "ACTIVE" })}>Publish</button>}{(exam.status === "SCHEDULED" || exam.status === "ACTIVE") && <button className="button button-outline button-small" disabled={changeExamStatus.isPending} onClick={() => changeExamStatus.mutate({ id: exam.id, status: "CLOSED" })}>Close</button>}<button className="button button-danger button-small" disabled={deleteExam.isPending} onClick={() => { if (window.confirm(`Permanently delete "${exam.title}"? This will also permanently delete ${exam._count.attempts} student attempt(s), answers, scores, and results. This cannot be undone.`)) deleteExam.mutate(exam); }}>Delete</button></td></tr>)}
         {!exams.data?.length && <EmptyRow columns={6} text={exams.isLoading ? "Loading exams…" : "No exams yet. Create your first mock exam."} />}
       </tbody></table></div>
     </section>
     {selectedExam && <section className="card table-card monitor-card"><div className="table-title"><div><span className="eyebrow">LIVE EXAM MONITOR</span><h2>Student attempts</h2></div><span className="live-label"><i /> Refreshes every 3 seconds</span></div>
       {monitor.error && <ErrorNotice message={(monitor.error as Error).message} />}
       <div className="table-wrap"><table><thead><tr><th>Student</th><th>Joined</th><th>Status</th><th>Attempts</th><th>Progress</th><th>Connection</th><th>Deadline</th><th>Actions</th></tr></thead><tbody>
-        {monitor.data?.map((attempt) => <tr key={attempt.user.id}><td className="strong-cell">{attempt.user.displayName}<small className="table-subtitle">{attempt.user.username}</small></td><td>{attempt.joined ? <StatusPill status="ACTIVE" /> : <span className="muted">—</span>}</td><td><StatusPill status={attempt.status} /></td><td>{attempt.attemptNumber ? `#${attempt.attemptNumber}` : "—"}{attempt.retakesRemaining > 0 && <small className="table-subtitle">{attempt.retakesRemaining} retake(s) available</small>}</td><td>{attempt.answeredCount} / {attempt.questionCount}</td><td><span className={`connection-pill ${attempt.online ? "online" : "offline"}`}><i />{attempt.online ? "Online" : "Offline"}</span></td><td>{attempt.deadline ? new Date(attempt.deadline).toLocaleTimeString() : "—"}</td><td className="action-cell">{attempt.id && attempt.status === "IN_PROGRESS" && <><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "extend" })}>+5 min</button><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "reset" })}>Reset</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Void this exam attempt?")) updateAttempt.mutate({ attempt, action: "void" }); }}>Void</button></>}{attempt.attemptsTaken > 0 && attempt.status !== "IN_PROGRESS" && <button className="button button-outline button-small" disabled={allowRetake.isPending} onClick={() => { if (window.confirm(`Allow ${attempt.user.displayName} one additional attempt? Their earlier results will be kept.`)) allowRetake.mutate(attempt); }}>Allow rewrite</button>}</td></tr>)}
+        {monitor.data?.map((attempt) => <tr key={attempt.user.id}>
+          <td className="strong-cell">{attempt.user.displayName}<small className="table-subtitle">{attempt.user.username}</small>
+            {attempt.attempts.length > 0 && <details className="attempt-history"><summary>{attempt.attempts.length} attempt{attempt.attempts.length === 1 ? "" : "s"} saved</summary>
+              <ul>{attempt.attempts.map((history) => <li key={history.id}>
+                <span>#{history.attemptNumber} · <StatusPill status={history.status} /> · {history.score === null ? "No score" : `Score ${history.score}`}</span>
+                <small>{history.submittedAt ? new Date(history.submittedAt).toLocaleString() : `Started ${new Date(history.startedAt).toLocaleString()}`}</small>
+                <button className="button button-danger button-small" disabled={deleteAttempt.isPending} onClick={() => {
+                  if (window.confirm(`Delete ${attempt.user.displayName}'s attempt #${history.attemptNumber}? Its answers and score will be permanently removed, and the student can restart the exam.`)) {
+                    deleteAttempt.mutate(history);
+                  }
+                }}>Delete attempt</button>
+              </li>)}</ul>
+            </details>}
+          </td>
+          <td>{attempt.joined ? <StatusPill status="ACTIVE" /> : <span className="muted">—</span>}</td>
+          <td><StatusPill status={attempt.status} /></td>
+          <td>{attempt.attemptsTaken}{attempt.attemptNumber ? <small className="table-subtitle">Latest: #{attempt.attemptNumber}</small> : " —"}{attempt.retakesRemaining > 0 && <small className="table-subtitle">{attempt.retakesRemaining} retake(s) available</small>}</td>
+          <td>{attempt.answeredCount} / {attempt.questionCount}</td>
+          <td><span className={`connection-pill ${attempt.online ? "online" : "offline"}`}><i />{attempt.online ? "Online" : "Offline"}</span></td>
+          <td>{attempt.deadline ? new Date(attempt.deadline).toLocaleTimeString() : "—"}</td>
+          <td className="action-cell">{attempt.id && attempt.status === "IN_PROGRESS" && <><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "extend" })}>+5 min</button><button className="button button-outline button-small" onClick={() => updateAttempt.mutate({ attempt, action: "reset" })}>Reset</button><button className="button button-outline button-small" onClick={() => { if (window.confirm("Void this exam attempt?")) updateAttempt.mutate({ attempt, action: "void" }); }}>Void</button></>}{attempt.attemptsTaken > 0 && attempt.status !== "IN_PROGRESS" && <button className="button button-outline button-small" disabled={allowRetake.isPending} onClick={() => { if (window.confirm(`Allow ${attempt.user.displayName} one additional attempt? Their earlier results will be kept.`)) allowRetake.mutate(attempt); }}>Allow rewrite</button>}</td>
+        </tr>)}
         {!monitor.data?.length && <EmptyRow columns={8} text={monitor.isLoading ? "Loading live attempts…" : "No students are assigned to this exam."} />}
       </tbody></table></div>
     </section>}
@@ -1220,12 +1297,21 @@ type AttemptRecord = {
   status: string;
   attemptNumber: number | null;
   attemptsTaken: number;
+  attempts: AttemptHistoryRecord[];
   retakesRemaining: number;
   joined: boolean;
   deadline: string | null;
   answeredCount: number;
   questionCount: number;
   online: boolean;
+};
+type AttemptHistoryRecord = {
+  id: string;
+  attemptNumber: number;
+  status: string;
+  score: number | null;
+  startedAt: string;
+  submittedAt: string | null;
 };
 type ExamFormData = {
   title: string; description: string; durationMinutes: number; questionCount: number; manualQuestionIds: string[];
@@ -1377,7 +1463,7 @@ function StudentPage({ user, page, onNavigate }: { user: User; page: Page; onNav
   </div>;
   return <div className="page-stack"><PageHeader eyebrow="YOUR LEARNING" title="My learning" description="Track your exam results and progress by topic." />
     <StudentAnalyticsPanel onPracticeStart={(examId) => start.mutate(examId)} />
-    <section className="card table-card"><div className="table-title"><h2>My results</h2><button className="button button-outline button-small" onClick={() => onNavigate("exams")}>View exams</button></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Attempt</th><th>Score</th><th>Submitted</th><th>Review</th></tr></thead><tbody>
+    <section className="card table-card"><div className="table-title"><div><h2>My results</h2><span className="muted">Latest saved score for each exam</span></div><button className="button button-outline button-small" onClick={() => onNavigate("exams")}>View exams</button></div><div className="table-wrap"><table><thead><tr><th>Exam</th><th>Attempt</th><th>Score</th><th>Submitted</th><th>Review</th></tr></thead><tbody>
       {results.data?.map((result) => <tr key={result.id}><td className="strong-cell">{result.exam.title}</td><td>#{result.attemptNumber}</td><td>{result.score ?? "—"}</td><td>{result.submittedAt ? new Date(result.submittedAt).toLocaleString() : "—"}</td><td><button className="button button-outline button-small" onClick={() => setReviewId(result.id)}>Review answers</button></td></tr>)}
       {!results.data?.length && <EmptyRow columns={5} text={results.isLoading ? "Loading results…" : "Your graded results will appear here."} />}
     </tbody></table></div></section>
@@ -1411,7 +1497,7 @@ function StudentAnalyticsPanel({ onPracticeStart }: { onPracticeStart: (examId: 
     {analytics.error && <ErrorNotice message={(analytics.error as Error).message} />}
     {error && <ErrorNotice message={error} />}
     <section className="card table-card">
-      <div className="table-title"><h2>Score trend</h2><span className="muted">Recent graded attempts</span></div>
+      <div className="table-title"><h2>Score trend</h2><span className="muted">Latest saved score for each exam</span></div>
       {analytics.data?.trend.length
         ? <div className="trend-list">{analytics.data.trend.map((result) => <div className="trend-row" key={result.id}><div><strong>{result.examTitle} · #{result.attemptNumber}</strong><small>{result.submittedAt ? new Date(result.submittedAt).toLocaleDateString() : "Submitted"}</small></div><progress max={100} value={result.percent} aria-label={`${result.percent}% on ${result.examTitle}`} /><strong>{result.percent}%</strong></div>)}</div>
         : <p className="muted">{analytics.isLoading ? "Loading your progress…" : "Complete a graded exam to see your score trend."}</p>}
